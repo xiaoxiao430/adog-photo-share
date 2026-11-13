@@ -52,6 +52,7 @@ class Client:
 
     def request(self, method, path, value=None, raw=None, headers=None):
         supplied = dict(headers or {})
+        supplied.setdefault('X-Aidog-Photo-Flow', '2')
         body = raw
         if value is not None:
             body = json.dumps(value).encode()
@@ -102,6 +103,7 @@ class PhotoServerIntegration(unittest.TestCase):
         env = {**os.environ, 'AIDOG_PHOTOS_BASE': BASE, 'AIDOG_PHOTOS_ORIGIN': self.origin,
                'AIDOG_PHOTOS_DATA': str(self.data), 'AIDOG_PHOTOS_CONFIG': str(config),
                'AIDOG_PHOTOS_PORT': str(self.port), 'PYTHONDONTWRITEBYTECODE': '1'}
+        self.env = env
         self.log = (self.home / 'server.log').open('w+')
         self.addCleanup(self.log.close)
         self.process = subprocess.Popen([sys.executable, str(PROJECT / 'server.py')], cwd=PROJECT,
@@ -159,6 +161,29 @@ class PhotoServerIntegration(unittest.TestCase):
     def commit(self, client, batch_id, method='system_share'):
         return client.request('POST', '/api/batch/commit', {'batchId': batch_id, 'method': method})
 
+    def prepare(self, client, batch_id):
+        response = client.request('POST', '/api/batch/prepare', {'batchId': batch_id})
+        self.assertEqual(response.status, 200, response.data)
+        self.assertEqual(response.data['batch']['status'], 'reserved')
+        self.assertEqual(len(response.data['batch']['photos']), 3)
+        return response.data['batch']
+
+    def restart_server(self):
+        self.stop_server()
+        self.process = subprocess.Popen([sys.executable, str(PROJECT / 'server.py')], cwd=PROJECT,
+                                        env=self.env, stdout=self.log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                self.log.seek(0)
+                self.fail('Local server exited on restart: ' + self.log.read())
+            try:
+                if self.admin.request('GET', '/api/health').status == 200:
+                    return
+            except (OSError, http.client.HTTPException):
+                time.sleep(0.025)
+        self.fail('Local server did not restart')
+
     def test_bulk_upload_preserves_unique_bytes_and_never_preuses(self):
         originals = dict(self.upload(9))
         dashboard = self.dashboard()
@@ -174,7 +199,7 @@ class PhotoServerIntegration(unittest.TestCase):
         self.upload(6)
         guest = self.client()
         first = self.bootstrap(guest)['batch']
-        self.assertEqual(first['status'], 'reserved')
+        self.assertEqual(first['status'], 'preview')
         self.assertEqual(len(first['photos']), 3)
         for item in first['photos']:
             response = guest.request('GET', '/api/image/' + item['id'])
@@ -184,19 +209,23 @@ class PhotoServerIntegration(unittest.TestCase):
         self.assertEqual(again['id'], first['id'])
         self.assertIsNone(again['usedAt'])
         self.assertTrue(all(p['usedAt'] is None for p in again['photos']))
-        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 3, 'used': 0, 'all': 6})
+        self.assertEqual(self.dashboard()['stats'], {'available': 6, 'reserved': 0, 'used': 0, 'all': 6})
 
     def test_concurrent_sessions_receive_disjoint_complete_groups(self):
         self.upload(24)
         guests = [self.client() for _ in range(8)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(self.bootstrap, guests))
+        self.assertTrue(all(r['batch']['status'] == 'preview' for r in results))
+        self.assertTrue(all(len(r['batch']['photos']) == 3 for r in results))
+        self.assertEqual(self.dashboard()['stats'], {'available': 24, 'reserved': 0, 'used': 0, 'all': 24})
+        pairs = list(zip(guests, [r['batch']['id'] for r in results]))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            prepared = list(pool.map(lambda pair: self.prepare(*pair), pairs))
         photo_ids = []
-        self.assertEqual(len({r['batch']['id'] for r in results}), 8)
-        for result in results:
-            self.assertEqual(result['batch']['status'], 'reserved')
-            self.assertEqual(len(result['batch']['photos']), 3)
-            photo_ids.extend(p['id'] for p in result['batch']['photos'])
+        self.assertEqual(len({b['id'] for b in prepared}), 8)
+        for selected in prepared:
+            photo_ids.extend(p['id'] for p in selected['photos'])
         self.assertEqual(len(photo_ids), len(set(photo_ids)))
         self.assertEqual(self.dashboard()['stats']['reserved'], 24)
         self.assertIsNone(self.bootstrap(self.client())['batch'])
@@ -209,10 +238,156 @@ class PhotoServerIntegration(unittest.TestCase):
         self.upload(1)
         self.assertEqual(len(self.bootstrap(guest)['batch']['photos']), 3)
 
+    def test_many_preview_visitors_do_not_exhaust_a_six_photo_library(self):
+        self.upload(6)
+        guests = [self.client() for _ in range(12)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(self.bootstrap, guests))
+        self.assertTrue(all(r['batch'] and r['batch']['status'] == 'preview' for r in results))
+        self.assertTrue(all(len(r['batch']['photos']) == 3 for r in results))
+        self.assertEqual(self.dashboard()['stats'], {'available': 6, 'reserved': 0, 'used': 0, 'all': 6})
+
+    def test_stale_client_flow_must_reload_before_preview_or_renew(self):
+        self.upload(3)
+        guest = self.client()
+        preview = self.bootstrap(guest)['batch']
+        for stale in ['', '1']:
+            for method, path, body in [('GET', '/api/bootstrap', None),
+                                       ('POST', '/api/batch/renew', {'batchId': preview['id']})]:
+                with self.subTest(flow=stale, path=path):
+                    response = guest.request(method, path, body, headers={'X-Aidog-Photo-Flow': stale})
+                    self.assertEqual(response.status, 409, response.data)
+                    self.assertIs(response.data['reloadRequired'], True)
+                    self.assertIn('刷新', response.data['error'])
+                    self.assertEqual(dict(response.headers).get('Connection'), 'close')
+        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
+        self.assertEqual(self.bootstrap(guest)['batch']['status'], 'preview')
+
+    def test_preview_cannot_commit_and_renew_does_not_lock_inventory(self):
+        self.upload(3)
+        guest = self.client()
+        preview = self.bootstrap(guest)['batch']
+        self.assertEqual(self.commit(guest, preview['id']).status, 409)
+        renewed = guest.request('POST', '/api/batch/renew', {'batchId': preview['id']})
+        self.assertEqual(renewed.status, 200, renewed.data)
+        # A non-exclusive preview may keep its own page record alive, while no photo is locked.
+        self.assertGreaterEqual(renewed.data['expiresAt'], preview['expiresAt'])
+        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
+        prepared = self.prepare(guest, preview['id'])
+        short_deadline = int(time.time() * 1000) + 5000
+        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
+            connection.execute('UPDATE batches SET expires=? WHERE id=?', (short_deadline, prepared['id']))
+        renewed = guest.request('POST', '/api/batch/renew', {'batchId': prepared['id']})
+        self.assertEqual(renewed.status, 200, renewed.data)
+        self.assertGreater(renewed.data['expiresAt'], short_deadline)
+        self.assertEqual(self.dashboard()['stats']['reserved'], 3)
+
+    def test_prepare_reselects_collision_and_returns_full_authorized_snapshot(self):
+        self.upload(6)
+        first, second = self.client(), self.client()
+        preview_a, preview_b = self.bootstrap(first)['batch'], self.bootstrap(second)['batch']
+        original_b_ids = {p['id'] for p in preview_b['photos']}
+        self.assertEqual({p['id'] for p in preview_a['photos']}, original_b_ids)
+        chosen_a = self.prepare(first, preview_a['id'])
+        for pid in original_b_ids:
+            self.assertEqual(second.request('GET', '/api/image/' + pid).status, 404)
+        chosen_b = self.prepare(second, preview_b['id'])
+        self.assertFalse({p['id'] for p in chosen_a['photos']} & {p['id'] for p in chosen_b['photos']})
+        for photo in chosen_b['photos']:
+            self.assertEqual(second.request('GET', '/api/image/' + photo['id']).status, 200)
+            self.assertEqual(first.request('GET', '/api/image/' + photo['id']).status, 404)
+        self.assertEqual(self.dashboard()['stats'], {'available': 0, 'reserved': 6, 'used': 0, 'all': 6})
+
+    def test_prepare_conflict_without_another_group_cannot_duplicate_delivery(self):
+        self.upload(3)
+        first, second = self.client(), self.client()
+        a, b = self.bootstrap(first)['batch'], self.bootstrap(second)['batch']
+        a = self.prepare(first, a['id'])
+        refused = second.request('POST', '/api/batch/prepare', {'batchId': b['id']})
+        self.assertEqual(refused.status, 409, refused.data)
+        self.assertIn('换一组', refused.data['error'])
+        self.assertEqual(self.commit(second, b['id']).status, 409)
+        self.assertEqual(self.commit(first, a['id']).status, 200)
+        for p in a['photos']:
+            self.assertEqual(second.request('GET', '/api/image/' + p['id']).status, 404)
+        self.assertEqual(self.dashboard()['stats'], {'available': 0, 'reserved': 0, 'used': 3, 'all': 3})
+
+    def test_releasing_prepared_group_returns_all_photos_to_preview_pool(self):
+        self.upload(6)
+        guest = self.client()
+        selected = self.prepare(guest, self.bootstrap(guest)['batch']['id'])
+        response = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
+        self.assertEqual(response.status, 200, response.data)
+        self.assertEqual(response.data['batch']['status'], 'preview')
+        self.assertFalse({p['id'] for p in response.data['batch']['photos']} & {p['id'] for p in selected['photos']})
+        self.assertEqual(self.commit(guest, selected['id']).status, 409)
+        self.assertEqual(self.dashboard()['stats'], {'available': 6, 'reserved': 0, 'used': 0, 'all': 6})
+
+    def test_single_group_can_be_previewed_again_after_switch_without_being_used(self):
+        self.upload(3)
+        guest = self.client()
+        selected = self.bootstrap(guest)['batch']
+        response = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
+        self.assertEqual(response.status, 200, response.data)
+        self.assertEqual(response.data['batch']['status'], 'preview')
+        self.assertNotEqual(response.data['batch']['id'], selected['id'])
+        self.assertEqual({p['id'] for p in response.data['batch']['photos']}, {p['id'] for p in selected['photos']})
+        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
+
+    def test_rotation_visits_all_twelve_photos_before_repeating_without_consumption(self):
+        self.upload(12)
+        guest = self.client()
+        selected = self.bootstrap(guest)['batch']
+        seen = set()
+        for index in range(4):
+            self.assertEqual(selected['status'], 'preview')
+            current = {photo['id'] for photo in selected['photos']}
+            self.assertEqual(len(current), 3)
+            self.assertFalse(current & seen, 'The first four groups must show twelve distinct photos')
+            seen.update(current)
+            if index < 3:
+                response = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
+                self.assertEqual(response.status, 200, response.data)
+                selected = response.data['batch']
+        self.assertEqual(len(seen), 12)
+        fifth = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
+        self.assertEqual(fifth.status, 200, fifth.data)
+        self.assertEqual(fifth.data['batch']['status'], 'preview')
+        self.assertEqual(len(fifth.data['batch']['photos']), 3)
+        self.assertTrue({photo['id'] for photo in fifth.data['batch']['photos']} <= seen)
+        dashboard = self.dashboard()
+        self.assertEqual(dashboard['stats'], {'available': 12, 'reserved': 0, 'used': 0, 'all': 12})
+        self.assertTrue(all(photo['usedAt'] is None for photo in dashboard['photos']))
+
+    def test_startup_migrates_legacy_preview_reservations_without_restoring_used(self):
+        self.upload(6)
+        used_guest, legacy_guest = self.client(), self.client()
+        used = self.prepare(used_guest, self.bootstrap(used_guest)['batch']['id'])
+        receipt = self.commit(used_guest, used['id'])
+        self.assertEqual(receipt.status, 200, receipt.data)
+        legacy = self.bootstrap(legacy_guest)['batch']
+        # Recreate the previous release's column layout and automatic preview reservation.
+        # All writes are confined to this test's temporary database.
+        self.stop_server()
+        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
+            connection.execute("UPDATE batches SET status='reserved' WHERE id=?", (legacy['id'],))
+            for photo in legacy['photos']:
+                connection.execute("UPDATE photos SET status='reserved',batch_id=? WHERE id=?", (legacy['id'], photo['id']))
+            connection.execute('ALTER TABLE batches DROP COLUMN prepared_at')
+        self.restart_server()
+        dashboard = self.dashboard()
+        self.assertEqual(dashboard['stats'], {'available': 3, 'reserved': 0, 'used': 3, 'all': 6})
+        self.assertEqual({p['usedAt'] for p in dashboard['photos'] if p['status'] == 'used'}, {receipt.data['usedAt']})
+        self.assertEqual(self.bootstrap(legacy_guest)['batch']['status'], 'preview')
+        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
+            self.assertEqual(connection.execute('SELECT status FROM batches WHERE id=?', (legacy['id'],)).fetchone()[0], 'preview')
+            self.assertIn('prepared_at', {r[1] for r in connection.execute('PRAGMA table_info(batches)')})
+
     def test_commit_is_idempotent_and_timestamps_match_all_three(self):
         self.upload(6)
         guest = self.client()
-        reserved = self.bootstrap(guest)['batch']
+        preview = self.bootstrap(guest)['batch']
+        reserved = self.prepare(guest, preview['id'])
         first = self.commit(guest, reserved['id'])
         self.assertEqual(first.status, 200, first.data)
         self.assertEqual(first.data['status'], 'used')
@@ -234,10 +409,12 @@ class PhotoServerIntegration(unittest.TestCase):
         owned = self.bootstrap(owner)['batch']
         other = self.bootstrap(stranger)['batch']
         self.assertNotEqual(owned['id'], other['id'])
+        owned = self.prepare(owner, owned['id'])
         for photo in owned['photos']:
             self.assertEqual(stranger.request('GET', '/api/image/' + photo['id']).status, 404)
             self.assertEqual(self.client().request('GET', '/api/image/' + photo['id']).status, 401)
         self.assertEqual(self.commit(stranger, owned['id']).status, 409)
+        self.assertEqual(stranger.request('POST', '/api/batch/prepare', {'batchId': owned['id']}).status, 409)
         self.assertEqual(stranger.request('POST', '/api/batch/release', {'batchId': owned['id']}).status, 409)
         self.assertEqual(self.dashboard()['stats']['used'], 0)
         self.assertEqual(self.commit(owner, owned['id']).status, 200)
@@ -249,12 +426,12 @@ class PhotoServerIntegration(unittest.TestCase):
         first = self.bootstrap(guest)['batch']
         response = guest.request('POST', '/api/batch/release', {'batchId': first['id']})
         self.assertEqual(response.status, 200, response.data)
-        self.assertEqual(response.data['batch']['status'], 'reserved')
+        self.assertEqual(response.data['batch']['status'], 'preview')
         self.assertNotEqual(response.data['batch']['id'], first['id'])
         self.assertFalse({p['id'] for p in first['photos']} &
                          {p['id'] for p in response.data['batch']['photos']})
         dashboard = self.dashboard()
-        self.assertEqual(dashboard['stats'], {'available': 3, 'reserved': 3, 'used': 0, 'all': 6})
+        self.assertEqual(dashboard['stats'], {'available': 6, 'reserved': 0, 'used': 0, 'all': 6})
         self.assertTrue(all(p['usedAt'] is None for p in dashboard['photos']))
         self.assertEqual(self.commit(guest, first['id']).status, 409)
 
@@ -262,8 +439,10 @@ class PhotoServerIntegration(unittest.TestCase):
         self.upload(6)
         first, second = self.client(), self.client()
         old = self.bootstrap(first)['batch']
+        old = self.prepare(first, old['id'])
         self.assertEqual(self.commit(first, old['id']).status, 200)
         new = self.bootstrap(second)['batch']
+        new = self.prepare(second, new['id'])
         self.assertFalse({p['id'] for p in old['photos']} & {p['id'] for p in new['photos']})
         self.assertEqual(self.commit(second, new['id']).status, 200)
         self.assertIsNone(self.bootstrap(self.client())['batch'])
@@ -285,6 +464,7 @@ class PhotoServerIntegration(unittest.TestCase):
         uploaded = self.upload(3)
         guest = self.client()
         owned = self.bootstrap(guest)['batch']
+        owned = self.prepare(guest, owned['id'])
         self.assertEqual(self.commit(guest, owned['id']).status, 200)
         for pid, content in uploaded:
             duplicate = self.admin.request('POST', '/api/admin/photos', raw=content,
@@ -433,6 +613,7 @@ class PhotoServerIntegration(unittest.TestCase):
         self.upload(3)
         guest = self.client()
         expired = self.bootstrap(guest)['batch']
+        expired = self.prepare(guest, expired['id'])
         # Change only the disposable test database's clock boundary; no sleep or production writes.
         with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
             connection.execute('UPDATE batches SET expires=? WHERE id=?', (int(time.time() * 1000) - 1000, expired['id']))
@@ -442,12 +623,14 @@ class PhotoServerIntegration(unittest.TestCase):
         self.assertNotEqual(replacement['id'], expired['id'])
         self.assertEqual({p['id'] for p in replacement['photos']}, {p['id'] for p in expired['photos']})
         self.assertEqual(guest.request('GET', '/api/image/' + expired['photos'][0]['id']).status, 404)
-        self.assertEqual(self.dashboard()['stats'], {'available': 0, 'reserved': 3, 'used': 0, 'all': 3})
+        self.assertEqual(replacement['status'], 'preview')
+        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
 
     def test_reserved_and_used_photos_cannot_be_deleted(self):
         self.upload(3)
         guest = self.client()
         selected = self.bootstrap(guest)['batch']
+        selected = self.prepare(guest, selected['id'])
         pid = selected['photos'][0]['id']
         self.assertEqual(self.admin.request('DELETE', '/api/admin/photos/' + pid).status, 409)
         self.assertEqual(self.commit(guest, selected['id']).status, 200)

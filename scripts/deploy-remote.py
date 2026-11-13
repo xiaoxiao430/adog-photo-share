@@ -13,6 +13,7 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -268,6 +269,65 @@ def remove_own_new_includes(raw, original):
     return text.encode()
 
 
+def inventory_snapshot():
+    database = ROOT / 'data/photos.sqlite3'
+    if not database.exists():
+        return {'columns': [], 'photos': {}, 'counts': {}, 'used': {}, 'reserved': {}, 'media': {}, 'batches': {}}
+    connection = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        need(connection.execute('PRAGMA quick_check').fetchone()[0] == 'ok', 'inventory_database_integrity')
+        columns = [row[1] for row in connection.execute('PRAGMA table_info(batches)')]
+        rows = [dict(row) for row in connection.execute('SELECT * FROM photos ORDER BY id')]
+        batches = {row['id']: dict(row) for row in connection.execute('SELECT * FROM batches')}
+        static_fields = ['id', 'name', 'mime', 'digest', 'size', 'created']
+        photos = {row['id']: {key: row[key] for key in static_fields} for row in rows}
+        used = {row['id']: {key: row[key] for key in ['status', 'used_at', 'method', 'batch_id']} for row in rows if row['status'] == 'used'}
+        reserved = {row['id']: row['batch_id'] for row in rows if row['status'] == 'reserved'}
+        counts = dict(connection.execute('SELECT status,count(*) FROM photos GROUP BY status'))
+    finally:
+        connection.close()
+    media = {}
+    for file in (ROOT / 'data/images').iterdir():
+        need(file.is_file() and not file.is_symlink(), 'media_file_shape')
+        media[file.name] = hashlib.sha256(file.read_bytes()).hexdigest()
+    return {'columns': columns, 'photos': photos, 'counts': counts, 'used': used, 'reserved': reserved, 'media': media, 'batches': batches}
+
+
+def schema_compatible(release):
+    database = ROOT / 'data/photos.sqlite3'
+    if not database.exists():
+        return True
+    connection = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
+    try:
+        migrated = 'prepared_at' in {row[1] for row in connection.execute('PRAGMA table_info(batches)')}
+    finally:
+        connection.close()
+    if not migrated:
+        return True
+    source = (release / 'server.py').read_text()
+    return 'prepared_at' in source and re.search(r'INSERT INTO batches\s*\(', source) is not None
+
+
+def verify_inventory(before, after):
+    need(before['photos'] == after['photos'], 'original_photo_rows_changed')
+    need(before['media'] == after['media'], 'original_media_bytes_changed')
+    need(all(after['used'].get(pid) == record for pid, record in before['used'].items()), 'old_used_record_changed')
+    migrated = 'prepared_at' not in before['columns'] and 'prepared_at' in after['columns']
+    released = 0
+    if migrated:
+        for pid, bid in before['reserved'].items():
+            old_batch = after['batches'].get(bid, {})
+            need(old_batch.get('status') == 'preview' and old_batch.get('prepared_at') is None, 'legacy_preview_reservation_not_released')
+            released += 1
+    return {'beforeCounts': before['counts'], 'afterCounts': after['counts'],
+            'originalPhotoCount': len(before['photos']), 'currentPhotoCount': len(after['photos']),
+            'originalPhotosRetained': True, 'originalMediaSha256Preserved': True,
+            'oldUsedCount': len(before['used']), 'oldUsedStatusAndTimePreserved': True,
+            'preparedAtColumnAdded': migrated, 'legacyBrowseReservationsReleased': released,
+            'oldSevenColumnReleaseRollbackForbidden': 'prepared_at' in after['columns']}
+
+
 def switch_current(relative):
     current = ROOT / 'current'
     temporary = ROOT / ('current.tmp-' + secrets.token_hex(6))
@@ -297,6 +357,7 @@ def main(value):
         release = ROOT / 'releases' / name
         need(release.is_dir() and not release.is_symlink(), 'rollback_release_missing')
         file_count = None
+        need(schema_compatible(release), 'rollback_release_incompatible_prepared_at')
     else:
         name, release, file_count = extract_release(value)
     diagnosed = diagnose(release)
@@ -310,6 +371,7 @@ def main(value):
         private_write(backup / 'launchd-before.plist', old_plist)
     stopped = False
     nginx_changed = False
+    config_before_sha = hashlib.sha256(CFG.read_bytes()).hexdigest()
     try:
         if had_service:
             stop()
@@ -318,6 +380,7 @@ def main(value):
             with tarfile.open(backup / 'data-before.tar.gz', 'w:gz') as tar:
                 tar.add(ROOT / 'data', arcname='data', recursive=True)
             os.chmod(backup / 'data-before.tar.gz', 0o600)
+        inventory_before = inventory_snapshot()
         nginx_files()
         # Other projects may publish while our isolated diagnostic is running.
         # Rebase our two include additions onto the latest unrelated config.
@@ -331,6 +394,8 @@ def main(value):
         private_write(PLIST, plist_bytes())
         switch_current('releases/' + name)
         start()
+        inventory_checks = verify_inventory(inventory_before, inventory_snapshot())
+        need(hashlib.sha256(CFG.read_bytes()).hexdigest() == config_before_sha, 'private_config_changed')
         command([NGINX_BIN, '-s', 'reload'])
         statuses = {}
         for route in ['/', '/admin', '/api/health']:
@@ -345,11 +410,21 @@ def main(value):
             'nginxSyntaxPassed': True, 'nginxUnrelatedBytesPreserved': remove_own_new_includes(NGINX.read_bytes(), nginx_apply_baseline) == nginx_apply_baseline,
             'concurrentUnrelatedNginxUpdateObserved': nginx_apply_baseline != old_nginx,
             'newNamespaceOnly': True, 'oldAppDataAndConfigMutated': False, 'backup': str(backup), 'checks': statuses,
-            'anonymousAdmin': status, 'phoneAlbumSaveVerified': False}
+            'anonymousAdmin': status, 'phoneAlbumSaveVerified': False,
+            'inventory': inventory_checks, 'privateConfigurationByteIdentical': True}
         json_write(ROOT / 'deploy-state.json', receipt)
         return receipt
     except Exception:
-        # Roll back only our own service and our newly inserted include lines.
+        # Once prepared_at exists, seven-value INSERT code cannot safely run.
+        if old_link and not schema_compatible(ROOT / old_link):
+            switch_current('releases/' + name)
+            if command(['launchctl', 'print', LABEL], check=False).returncode != 0:
+                try:
+                    start()
+                except Exception:
+                    pass
+            raise RuntimeError('deployment_failed_schema_migrated_compatible_release_retained')
+        # Roll back only compatible service code and our newly inserted includes.
         if command(['launchctl', 'print', LABEL], check=False).returncode == 0:
             stop()
         if old_link:

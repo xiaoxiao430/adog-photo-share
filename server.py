@@ -24,6 +24,7 @@ ORIGIN = os.environ.get('AIDOG_PHOTOS_ORIGIN', 'http://127.0.0.1:18988').rstrip(
 DATA = Path(os.environ.get('AIDOG_PHOTOS_DATA', str(Path.home() / '.local/share/aidog-photos')))
 CONFIG = Path(os.environ.get('AIDOG_PHOTOS_CONFIG', str(Path.home() / '.config/aidog-photos/config.json')))
 LEASE = 15 * 60 * 1000
+DELIVERY_LEASE = 5 * 60 * 1000
 DAY = 86400000
 MAX_IMAGE = 12 * 1024 * 1024
 PLATFORMS = [('meituan', '美团'), ('dianping', '大众点评'), ('douyin', '抖音')]
@@ -74,6 +75,14 @@ def init():
         CREATE INDEX IF NOT EXISTS photo_status ON photos(status,created,id);
         CREATE INDEX IF NOT EXISTS batch_session ON batches(session_id,created);
         ''')
+        # Old releases reserved the entire inventory during page viewing. Only
+        # batches with an explicit prepare time may now hold exclusive photos.
+        if not c.in_transaction:
+            c.execute('BEGIN IMMEDIATE')
+        if 'prepared_at' not in {r['name'] for r in c.execute('PRAGMA table_info(batches)')}:
+            c.execute('ALTER TABLE batches ADD COLUMN prepared_at INTEGER')
+            c.execute("UPDATE photos SET status='available',batch_id=NULL WHERE status='reserved' AND batch_id IN (SELECT id FROM batches WHERE status='reserved' AND prepared_at IS NULL)")
+            c.execute("UPDATE batches SET status='preview' WHERE status='reserved' AND prepared_at IS NULL")
         c.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', ('storeName', '爱多格宠物医院·景观路总院'))
         for key, value in DEFAULT_LINKS.items():
             c.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', ('url:' + key, value))
@@ -83,7 +92,7 @@ def init():
 def expire(c):
     stamp = now()
     c.execute("UPDATE photos SET status='available',batch_id=NULL WHERE status='reserved' AND batch_id IN (SELECT id FROM batches WHERE status='reserved' AND expires<=?)", (stamp,))
-    c.execute("UPDATE batches SET status='expired' WHERE status='reserved' AND expires<=?", (stamp,))
+    c.execute("UPDATE batches SET status='expired' WHERE status IN ('reserved','preview') AND expires<=?", (stamp,))
     c.execute('DELETE FROM limits WHERE reset<?', (stamp - DAY,))
     c.execute('DELETE FROM sessions WHERE expires<?', (stamp,))
 
@@ -107,27 +116,58 @@ def batch(c, b):
             'method': b['method'], 'photos': [photo(p) for p in rows], 'receipts': []}
 
 
+def choose_photos(c, previous=None, sid=None):
+    previous = previous or []
+    marks = ','.join('?' for _ in previous)
+    # Rotate through the whole library, then reuse the least recently viewed
+    # *unused* candidates. Excluding only the previous three toggles A/B forever.
+    query = "SELECT p.id FROM photos p LEFT JOIN (SELECT bp.photo_id,MAX(b.created) seen_at FROM batch_photos bp JOIN batches b ON b.id=bp.batch_id WHERE b.session_id=? GROUP BY bp.photo_id) seen ON seen.photo_id=p.id WHERE p.status='available'"
+    order = ' ORDER BY COALESCE(seen.seen_at,0),p.created,p.id LIMIT 3'
+    rows = c.execute(query + (' AND p.id NOT IN (' + marks + ')' if previous else '') + order, [sid or ''] + previous).fetchall()
+    if len(rows) < 3:
+        rows = c.execute(query + order, (sid or '',)).fetchall()
+    return rows
+
+
 def reserve(c, sid, previous=None):
     expire(c)
     s = c.execute('SELECT current_batch FROM sessions WHERE id=?', (sid,)).fetchone()
-    b = c.execute("SELECT * FROM batches WHERE id=? AND session_id=? AND status IN ('reserved','used')", (s['current_batch'], sid)).fetchone() if s else None
+    b = c.execute("SELECT * FROM batches WHERE id=? AND session_id=? AND status IN ('preview','reserved','used')", (s['current_batch'], sid)).fetchone() if s else None
+    if b and b['status'] == 'preview':
+        count = c.execute("SELECT COUNT(*) FROM photos p JOIN batch_photos bp ON p.id=bp.photo_id WHERE bp.batch_id=? AND p.status='available'", (b['id'],)).fetchone()[0]
+        if count != 3:
+            c.execute("UPDATE batches SET status='released' WHERE id=?", (b['id'],))
+            b = None
     if not b:
-        # Prefer another complete group when switching; never mix a released group
-        # into its replacement when at least three other photos are available.
-        previous = previous or []
-        marks = ','.join('?' for _ in previous)
-        rows = c.execute("SELECT id FROM photos WHERE status='available'" + (' AND id NOT IN (' + marks + ')' if previous else '') + ' ORDER BY created,id LIMIT 3', previous).fetchall()
-        if len(rows) < 3:
-            rows = c.execute("SELECT id FROM photos WHERE status='available' ORDER BY created,id LIMIT 3").fetchall()
+        rows = choose_photos(c, previous, sid)
         if len(rows) == 3:
             bid, stamp = secrets.token_hex(16), now()
-            c.execute("INSERT INTO batches VALUES(?,?,'reserved',?,?,NULL,NULL)", (bid, sid, stamp + LEASE, stamp))
+            c.execute("INSERT INTO batches(id,session_id,status,expires,created) VALUES(?,?,'preview',?,?)", (bid, sid, stamp + LEASE, stamp))
             for i, p in enumerate(rows):
-                c.execute("UPDATE photos SET status='reserved',batch_id=? WHERE id=? AND status='available'", (bid, p['id']))
                 c.execute('INSERT INTO batch_photos VALUES(?,?,?)', (bid, p['id'], i))
             c.execute('UPDATE sessions SET current_batch=? WHERE id=?', (bid, sid))
             b = c.execute('SELECT * FROM batches WHERE id=?', (bid,)).fetchone()
     return {**settings(c), 'batch': batch(c, b), 'availableCount': c.execute("SELECT COUNT(*) FROM photos WHERE status='available'").fetchone()[0]}
+
+
+def prepare(c, b):
+    if b['status'] in ('reserved', 'used'):
+        return b
+    ids = [r[0] for r in c.execute('SELECT photo_id FROM batch_photos WHERE batch_id=? ORDER BY position', (b['id'],))]
+    count = c.execute("SELECT COUNT(*) FROM photos WHERE status='available' AND id IN (SELECT photo_id FROM batch_photos WHERE batch_id=?)", (b['id'],)).fetchone()[0]
+    if count != 3:
+        rows = choose_photos(c, ids, b['session_id'])
+        if len(rows) != 3:
+            raise Error(409, '这组照片已被领取，请换一组重试')
+        c.execute('DELETE FROM batch_photos WHERE batch_id=?', (b['id'],))
+        for i, p in enumerate(rows):
+            c.execute('INSERT INTO batch_photos VALUES(?,?,?)', (b['id'], p['id'], i))
+    stamp = now()
+    changed = c.execute("UPDATE photos SET status='reserved',batch_id=? WHERE status='available' AND id IN (SELECT photo_id FROM batch_photos WHERE batch_id=?)", (b['id'], b['id'])).rowcount
+    if changed != 3:
+        raise Error(409, '这组照片已被领取，请换一组重试')
+    c.execute("UPDATE batches SET status='reserved',prepared_at=?,expires=? WHERE id=?", (stamp, stamp + DELIVERY_LEASE, b['id']))
+    return c.execute('SELECT * FROM batches WHERE id=?', (b['id'],)).fetchone()
 
 
 def valid_link(key, value):
@@ -318,6 +358,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise Error(403, '请从本站页面操作')
             if self.headers.get('Sec-Fetch-Site') == 'cross-site' and path.startswith('/api/'):
                 raise Error(403, '请从本站页面操作')
+            if path == '/api/bootstrap' or path.startswith('/api/batch/'):
+                if self.headers.get('X-Aidog-Photo-Flow') != '2':
+                    self.close_connection = True
+                    return self.respond(409, {'error': '页面已更新，请刷新网页再下载照片', 'reloadRequired': True}, headers={'Connection': 'close'})
             if path == '/api/health' and self.command == 'GET':
                 return self.respond(200, {'ok': True, 'service': 'aidog-photos'})
             if path == '/api/admin/login' and self.command == 'POST':
@@ -359,9 +403,11 @@ class Handler(BaseHTTPRequestHandler):
                     sid = self.identity(c)
                     expire(c)
                     b = c.execute('SELECT * FROM batches WHERE id=? AND session_id=?', (str(value.get('batchId', '')), sid)).fetchone()
-                    if not b or b['status'] not in ('reserved', 'used'):
+                    if not b or b['status'] not in ('preview', 'reserved', 'used'):
                         raise Error(409, '这组照片已过期，请刷新领取新照片')
                     if path == '/api/batch/commit':
+                        if b['status'] == 'preview':
+                            raise Error(409, '请先点击下载照片，再确认保存')
                         method = value.get('method')
                         if method not in ('system_share', 'manual_confirm', 'browser_download'):
                             raise Error(400, '保存方式不正确')
@@ -374,13 +420,21 @@ class Handler(BaseHTTPRequestHandler):
                             c.execute("UPDATE batches SET status='used',used_at=?,method=? WHERE id=?", (stamp, method, b['id']))
                         b = c.execute('SELECT * FROM batches WHERE id=?', (b['id'],)).fetchone()
                         result = {'status': 'used', 'usedAt': b['used_at'], 'method': b['method']}
-                    elif path in ('/api/batch/renew', '/api/batch/prepare'):
-                        deadline = now() + LEASE
-                        c.execute("UPDATE batches SET expires=? WHERE id=? AND status='reserved'", (deadline, b['id']))
-                        result = {'expiresAt': deadline if b['status'] == 'reserved' else b['expires']}
+                    elif path == '/api/batch/prepare':
+                        b = prepare(c, b)
+                        result = {'expiresAt': b['expires'], 'batch': batch(c, b)}
+                    elif path == '/api/batch/renew':
+                        deadline = now() + (DELIVERY_LEASE if b['status'] == 'reserved' else LEASE)
+                        c.execute("UPDATE batches SET expires=? WHERE id=? AND status IN ('reserved','preview')", (deadline, b['id']))
+                        result = {'expiresAt': deadline if b['status'] != 'used' else b['expires']}
+                    elif path == '/api/batch/cancel':
+                        if b['status'] == 'reserved':
+                            c.execute("UPDATE photos SET status='available',batch_id=NULL WHERE batch_id=? AND status='reserved'", (b['id'],))
+                            c.execute("UPDATE batches SET status='preview',prepared_at=NULL,expires=? WHERE id=?", (now() + LEASE, b['id']))
+                        result = reserve(c, sid)
                     elif path == '/api/batch/release':
                         previous = [r[0] for r in c.execute('SELECT photo_id FROM batch_photos WHERE batch_id=?', (b['id'],))]
-                        if b['status'] == 'reserved':
+                        if b['status'] in ('preview', 'reserved'):
                             c.execute("UPDATE photos SET status='available',batch_id=NULL WHERE batch_id=? AND status='reserved'", (b['id'],))
                             c.execute("UPDATE batches SET status='released' WHERE id=?", (b['id'],))
                         c.execute('UPDATE sessions SET current_batch=NULL WHERE id=?', (sid,))
@@ -393,7 +447,7 @@ class Handler(BaseHTTPRequestHandler):
                 with database(True) as c:
                     sid = self.identity(c)
                     expire(c)
-                    p = c.execute("SELECT p.* FROM photos p JOIN batch_photos bp ON bp.photo_id=p.id JOIN batches b ON b.id=bp.batch_id WHERE p.id=? AND b.session_id=? AND b.status IN ('reserved','used') AND p.batch_id=b.id", (pid, sid)).fetchone()
+                    p = c.execute("SELECT p.* FROM photos p JOIN batch_photos bp ON bp.photo_id=p.id JOIN batches b ON b.id=bp.batch_id WHERE p.id=? AND b.session_id=? AND ((b.status='preview' AND p.status='available') OR (b.status IN ('reserved','used') AND p.batch_id=b.id))", (pid, sid)).fetchone()
                     if not p:
                         raise Error(404, '照片不存在或页面已过期')
                 return self.image(p)

@@ -1,6 +1,6 @@
 {
   "name": "adog-photo-share",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "爱多格三图领取与照片管理，运行仅需Python标准库",
