@@ -14,12 +14,15 @@ import subprocess
 import time
 import zlib
 from contextlib import contextmanager
+from email import policy
+from email.parser import BytesParser
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent
+PHOTO_SCHEMA_VERSION = 3
 BASE = os.environ.get('AIDOG_PHOTOS_BASE', '/aidog-photos').rstrip('/')
 ORIGIN = os.environ.get('AIDOG_PHOTOS_ORIGIN', 'http://127.0.0.1:18988').rstrip('/')
 DATA = Path(os.environ.get('AIDOG_PHOTOS_DATA', str(Path.home() / '.local/share/aidog-photos')))
@@ -74,6 +77,8 @@ def init():
         CREATE TABLE IF NOT EXISTS batch_photos(batch_id TEXT NOT NULL,photo_id TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(batch_id,photo_id));
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS limits(key TEXT PRIMARY KEY,count INTEGER NOT NULL,reset INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS packages(id TEXT PRIMARY KEY,title TEXT NOT NULL,copy TEXT NOT NULL,created INTEGER NOT NULL,upload_id TEXT UNIQUE);
+        CREATE TABLE IF NOT EXISTS package_photos(package_id TEXT NOT NULL,photo_id TEXT NOT NULL UNIQUE,position INTEGER NOT NULL,PRIMARY KEY(package_id,position));
         CREATE INDEX IF NOT EXISTS photo_status ON photos(status,created,id);
         CREATE INDEX IF NOT EXISTS batch_session ON batches(session_id,created);
         ''')
@@ -85,6 +90,31 @@ def init():
             c.execute('ALTER TABLE batches ADD COLUMN prepared_at INTEGER')
             c.execute("UPDATE photos SET status='available',batch_id=NULL WHERE status='reserved' AND batch_id IN (SELECT id FROM batches WHERE status='reserved' AND prepared_at IS NULL)")
             c.execute("UPDATE batches SET status='preview' WHERE status='reserved' AND prepared_at IS NULL")
+        for column in ('package_id', 'copy_snapshot', 'title_snapshot'):
+            if column not in {r['name'] for r in c.execute('PRAGMA table_info(batches)')}:
+                c.execute('ALTER TABLE batches ADD COLUMN ' + column + ' TEXT')
+        c.execute('CREATE INDEX IF NOT EXISTS batch_package_session ON batches(package_id,session_id,created)')
+        migration = Path(os.environ.get('AIDOG_PHOTOS_INITIAL_PACKAGES', str(CONFIG.parent / 'initial-packages.json')))
+        if migration.is_file() and not c.execute("SELECT 1 FROM settings WHERE key='packages_initial_import'").fetchone():
+            entries = json.loads(migration.read_text()).get('packages', [])
+            if c.execute('SELECT COUNT(*) FROM packages').fetchone()[0]:
+                raise RuntimeError('package_migration_already_started')
+            flat = [pid for item in entries for pid in item.get('photoIds', [])]
+            if not entries or len(flat) != len(set(flat)) or len(flat) != 3 * len(entries):
+                raise RuntimeError('package_migration_invalid_photos')
+            for item in entries:
+                text = item.get('copy', item.get('body', '')).strip()
+                title = item.get('title', '').strip()
+                if not text or len(text) > 1000 or not title or len(title) > 80:
+                    raise RuntimeError('package_migration_invalid_copy')
+                for pid in item['photoIds']:
+                    if not c.execute("SELECT 1 FROM photos WHERE id=? AND status!='deleted'", (pid,)).fetchone():
+                        raise RuntimeError('package_migration_photo_missing')
+                package_id = item.get('key') or secrets.token_hex(16)
+                c.execute('INSERT INTO packages VALUES(?,?,?,?,NULL)', (package_id, title, text, now()))
+                for position, pid in enumerate(item['photoIds']):
+                    c.execute('INSERT INTO package_photos VALUES(?,?,?)', (package_id, pid, position))
+            c.execute("INSERT INTO settings VALUES('packages_initial_import',?)", (str(now()),))
         c.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', ('storeName', '爱多格宠物医院·景观路总院'))
         for key, value in DEFAULT_LINKS.items():
             c.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', ('url:' + key, value))
@@ -115,56 +145,75 @@ def batch(c, b):
     if not b:
         return None
     rows = c.execute('SELECT p.* FROM photos p JOIN batch_photos bp ON bp.photo_id=p.id WHERE bp.batch_id=? ORDER BY bp.position', (b['id'],)).fetchall()
-    return {'id': b['id'], 'status': b['status'], 'expiresAt': b['expires'], 'usedAt': b['used_at'],
+    return {'id': b['id'], 'packageId': b['package_id'], 'title': b['title_snapshot'] or '', 'copy': b['copy_snapshot'] or '', 'status': b['status'], 'expiresAt': b['expires'], 'usedAt': b['used_at'],
             'method': b['method'], 'photos': [photo(p) for p in rows], 'receipts': []}
 
 
-def choose_photos(c, previous=None, sid=None):
-    previous = previous or []
-    marks = ','.join('?' for _ in previous)
-    # Rotate through the whole library, then reuse the least recently viewed
-    # *unused* candidates. Excluding only the previous three toggles A/B forever.
-    query = "SELECT p.id FROM photos p LEFT JOIN (SELECT bp.photo_id,MAX(b.created) seen_at FROM batch_photos bp JOIN batches b ON b.id=bp.batch_id WHERE b.session_id=? GROUP BY bp.photo_id) seen ON seen.photo_id=p.id WHERE p.status='available'"
-    order = ' ORDER BY COALESCE(seen.seen_at,0),p.created,p.id LIMIT 3'
-    rows = c.execute(query + (' AND p.id NOT IN (' + marks + ')' if previous else '') + order, [sid or ''] + previous).fetchall()
-    if len(rows) < 3:
+def package_rows(c, package_id):
+    return c.execute('SELECT p.* FROM photos p JOIN package_photos pp ON p.id=pp.photo_id WHERE pp.package_id=? ORDER BY pp.position', (package_id,)).fetchall()
+
+
+def package_data(c, row):
+    rows = package_rows(c, row['id'])
+    states = [p['status'] for p in rows]
+    state = 'used' if 'used' in states else 'reserved' if 'reserved' in states else 'available' if len(rows) == 3 and all(s == 'available' for s in states) else 'archived'
+    dates = [p['used_at'] for p in rows if p['used_at']]
+    methods = [p['method'] for p in rows if p['method']]
+    return {'id': row['id'], 'title': row['title'], 'copy': row['copy'], 'photos': [photo(p, True) for p in rows], 'status': state,
+            'createdAt': row['created'], 'usedAt': max(dates) if dates else None, 'method': methods[0] if methods else None}
+
+
+def available_packages(c, sid=None, previous=None):
+    query = "SELECT k.* FROM packages k LEFT JOIN (SELECT package_id,MAX(created) seen_at FROM batches WHERE session_id=? GROUP BY package_id) seen ON seen.package_id=k.id WHERE (SELECT COUNT(*) FROM package_photos WHERE package_id=k.id)=3 AND NOT EXISTS(SELECT 1 FROM package_photos pp JOIN photos p ON p.id=pp.photo_id WHERE pp.package_id=k.id AND p.status!='available')"
+    order = ' ORDER BY COALESCE(seen.seen_at,0),k.created,k.id'
+    rows = c.execute(query + (' AND k.id!=?' if previous else '') + order, [sid or ''] + ([previous] if previous else [])).fetchall()
+    if not rows and previous:
         rows = c.execute(query + order, (sid or '',)).fetchall()
     return rows
+
+
+def set_batch_package(c, bid, row):
+    c.execute('DELETE FROM batch_photos WHERE batch_id=?', (bid,))
+    for i, p in enumerate(package_rows(c, row['id'])):
+        c.execute('INSERT INTO batch_photos VALUES(?,?,?)', (bid, p['id'], i))
+    c.execute('UPDATE batches SET package_id=?,copy_snapshot=?,title_snapshot=? WHERE id=?', (row['id'], row['copy'], row['title'], bid))
 
 
 def reserve(c, sid, previous=None):
     expire(c)
     s = c.execute('SELECT current_batch FROM sessions WHERE id=?', (sid,)).fetchone()
-    b = c.execute("SELECT * FROM batches WHERE id=? AND session_id=? AND status IN ('preview','reserved','used')", (s['current_batch'], sid)).fetchone() if s else None
+    b = c.execute("SELECT * FROM batches WHERE id=? AND session_id=? AND package_id IS NOT NULL AND status IN ('preview','reserved','used')", (s['current_batch'], sid)).fetchone() if s else None
     if b and b['status'] == 'preview':
         count = c.execute("SELECT COUNT(*) FROM photos p JOIN batch_photos bp ON p.id=bp.photo_id WHERE bp.batch_id=? AND p.status='available'", (b['id'],)).fetchone()[0]
-        if count != 3:
+        current_package = c.execute('SELECT * FROM packages WHERE id=?', (b['package_id'],)).fetchone()
+        if count != 3 or not current_package:
             c.execute("UPDATE batches SET status='released' WHERE id=?", (b['id'],))
             b = None
+        else:
+            set_batch_package(c, b['id'], current_package)
+            b = c.execute('SELECT * FROM batches WHERE id=?', (b['id'],)).fetchone()
     if not b:
-        rows = choose_photos(c, previous, sid)
-        if len(rows) == 3:
+        rows = available_packages(c, sid, previous)
+        if rows:
             bid, stamp = secrets.token_hex(16), now()
             c.execute("INSERT INTO batches(id,session_id,status,expires,created) VALUES(?,?,'preview',?,?)", (bid, sid, stamp + LEASE, stamp))
-            for i, p in enumerate(rows):
-                c.execute('INSERT INTO batch_photos VALUES(?,?,?)', (bid, p['id'], i))
+            set_batch_package(c, bid, rows[0])
             c.execute('UPDATE sessions SET current_batch=? WHERE id=?', (bid, sid))
             b = c.execute('SELECT * FROM batches WHERE id=?', (bid,)).fetchone()
-    return {**settings(c), 'batch': batch(c, b), 'availableCount': c.execute("SELECT COUNT(*) FROM photos WHERE status='available'").fetchone()[0]}
+    return {**settings(c), 'batch': batch(c, b), 'availableCount': 3 * len(available_packages(c))}
 
 
 def prepare(c, b):
     if b['status'] in ('reserved', 'used'):
         return b
-    ids = [r[0] for r in c.execute('SELECT photo_id FROM batch_photos WHERE batch_id=? ORDER BY position', (b['id'],))]
+    current_package = c.execute('SELECT * FROM packages WHERE id=?', (b['package_id'],)).fetchone()
     count = c.execute("SELECT COUNT(*) FROM photos WHERE status='available' AND id IN (SELECT photo_id FROM batch_photos WHERE batch_id=?)", (b['id'],)).fetchone()[0]
-    if count != 3:
-        rows = choose_photos(c, ids, b['session_id'])
-        if len(rows) != 3:
+    if count != 3 or not current_package:
+        rows = available_packages(c, b['session_id'], b['package_id'])
+        if not rows:
             raise Error(409, '这组照片已被领取，请换一组重试')
-        c.execute('DELETE FROM batch_photos WHERE batch_id=?', (b['id'],))
-        for i, p in enumerate(rows):
-            c.execute('INSERT INTO batch_photos VALUES(?,?,?)', (b['id'], p['id'], i))
+        current_package = rows[0]
+    set_batch_package(c, b['id'], current_package)
     stamp = now()
     changed = c.execute("UPDATE photos SET status='reserved',batch_id=? WHERE status='available' AND id IN (SELECT photo_id FROM batch_photos WHERE batch_id=?)", (b['id'], b['id'])).rowcount
     if changed != 3:
@@ -285,6 +334,17 @@ def create_thumbnail(pid):
         temporary.unlink(missing_ok=True)
 
 
+def package_text(value):
+    text = value.get('copy', '')
+    title = value.get('title', '')
+    if not isinstance(text, str) or not text.strip() or len(text.strip()) > 1000:
+        raise Error(400, '每套必须填写1至1000字的对应文案')
+    if not isinstance(title, str) or len(title.strip()) > 80:
+        raise Error(400, '套装标题最多80字')
+    text = text.replace('\r\n', '\n').strip()
+    return title.strip() or text.split('\n', 1)[0][:18], text
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'AidogPhotos/1'
     protocol_version = 'HTTP/1.1'
@@ -329,6 +389,45 @@ class Handler(BaseHTTPRequestHandler):
             return value
         except (ValueError, UnicodeError):
             raise Error(400, '提交内容格式不正确')
+
+    def package_form(self):
+        content_type = self.headers.get('Content-Type', '')
+        if not content_type.lower().startswith('multipart/form-data;'):
+            raise Error(400, '请一次选择3张照片并填写对应文案')
+        raw = self.body(36 * 1024 * 1024 + 65536, True)
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(('Content-Type: ' + content_type + '\r\nMIME-Version: 1.0\r\n\r\n').encode('ascii') + raw)
+            if not message.is_multipart() or message.defects:
+                raise ValueError()
+            fields, files = {}, []
+            for part in message.iter_parts():
+                name = part.get_param('name', header='content-disposition')
+                content = part.get_payload(decode=True)
+                if content is None:
+                    raise ValueError()
+                if name == 'files' and part.get_filename() is not None:
+                    filename = re.sub(r'[\x00-\x1f\x7f]', '', part.get_filename().replace('\\', '/').rsplit('/', 1)[-1])[:180] or '照片'
+                    files.append({'name': filename, 'mime': part.get_content_type(), 'data': content, 'digest': hashlib.sha256(content).hexdigest()})
+                elif name in ('copy', 'title', 'uploadId') and name not in fields:
+                    fields[name] = content.decode('utf-8', errors='strict')
+                else:
+                    raise ValueError()
+        except (ValueError, UnicodeError, AttributeError):
+            raise Error(400, '上传格式不正确，请重新选择3张图片和文案')
+        title, text = package_text(fields)
+        if len(files) != 3:
+            raise Error(400, '每套必须正好上传3张照片')
+        upload_id = fields.get('uploadId', '')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{12,80}', upload_id):
+            raise Error(400, '本次上传标识无效，请刷新后台重试')
+        for file in files:
+            if not 0 < len(file['data']) <= MAX_IMAGE:
+                raise Error(413, '每张照片最多12MB')
+            if not valid_image(file['data'], file['mime']):
+                raise Error(400, '照片内容不完整，请选择JPG、PNG或WebP照片')
+        if len({file['digest'] for file in files}) != 3:
+            raise Error(400, '一套中的3张照片不能重复')
+        return title, text, upload_id, files
 
     def cookie(self, kind, value, seconds):
         result = f'aidog_photos_{kind}={value}; Path={BASE}/; Max-Age={seconds}; HttpOnly; SameSite=Lax'
@@ -392,7 +491,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('Sec-Fetch-Site') == 'cross-site' and path.startswith('/api/'):
                 raise Error(403, '请从本站页面操作')
             if path == '/api/bootstrap' or path.startswith('/api/batch/'):
-                if self.headers.get('X-Aidog-Photo-Flow') != '2':
+                if self.headers.get('X-Aidog-Photo-Flow') != '3':
                     self.close_connection = True
                     return self.respond(409, {'error': '页面已更新，请刷新网页再下载照片', 'reloadRequired': True}, headers={'Connection': 'close'})
             if path == '/api/health' and self.command == 'GET':
@@ -466,7 +565,7 @@ class Handler(BaseHTTPRequestHandler):
                             c.execute("UPDATE batches SET status='preview',prepared_at=NULL,expires=? WHERE id=?", (now() + LEASE, b['id']))
                         result = reserve(c, sid)
                     elif path == '/api/batch/release':
-                        previous = [r[0] for r in c.execute('SELECT photo_id FROM batch_photos WHERE batch_id=?', (b['id'],))]
+                        previous = b['package_id']
                         if b['status'] in ('preview', 'reserved'):
                             c.execute("UPDATE photos SET status='available',batch_id=NULL WHERE batch_id=? AND status='reserved'", (b['id'],))
                             c.execute("UPDATE batches SET status='released' WHERE id=?", (b['id'],))
@@ -528,6 +627,96 @@ class Handler(BaseHTTPRequestHandler):
                 if not p:
                     raise Error(404, '照片不存在')
             return self.image(p, parse_qs(url.query).get('variant', [''])[0] == 'preview')
+        if path == '/api/admin/packages' and self.command == 'GET':
+            query = parse_qs(url.query)
+            state = query.get('status', ['all'])[0]
+            if state not in ('all', 'available', 'reserved', 'used'):
+                raise Error(400, '筛选状态不正确')
+            try:
+                page = max(1, min(100000, int(query.get('page', ['1'])[0])))
+            except ValueError:
+                raise Error(400, '页码不正确')
+            with database(True) as c:
+                expire(c)
+                items = [package_data(c, row) for row in c.execute('SELECT * FROM packages ORDER BY created DESC,id DESC')]
+                stats = {s: sum(p['status'] == s for p in items) for s in ('available', 'reserved', 'used')}
+                stats['all'] = len(items)
+                filtered = [p for p in items if state == 'all' or p['status'] == state]
+                result = {**settings(c), 'packages': filtered[(page - 1) * 12:page * 12], 'total': len(filtered), 'page': page, 'pageSize': 12, 'stats': stats}
+            return self.respond(200, result)
+        if path == '/api/admin/packages' and self.command == 'POST':
+            title, text, upload_id, files = self.package_form()
+            written, new_ids = [], []
+            try:
+                with database(True) as c:
+                    previous = c.execute('SELECT * FROM packages WHERE upload_id=?', (upload_id,)).fetchone()
+                    if previous:
+                        old_digests = [p['digest'] for p in package_rows(c, previous['id'])]
+                        if old_digests != [f['digest'] for f in files] or previous['copy'] != text or previous['title'] != title:
+                            raise Error(409, '本次上传内容已修改，请重新提交')
+                        result = {'id': previous['id'], 'duplicate': True, 'package': package_data(c, previous)}
+                    else:
+                        existing = [c.execute('SELECT * FROM photos WHERE digest=?', (f['digest'],)).fetchone() for f in files]
+                        linked = [c.execute('SELECT package_id FROM package_photos WHERE photo_id=?', (p['id'],)).fetchone() if p else None for p in existing]
+                        if all(linked) and len({p['package_id'] for p in linked}) == 1:
+                            row = c.execute('SELECT * FROM packages WHERE id=?', (linked[0]['package_id'],)).fetchone()
+                            result = {'id': row['id'], 'duplicate': True, 'package': package_data(c, row)}
+                        else:
+                            if any(linked) or any(p and p['status'] != 'available' for p in existing):
+                                raise Error(409, '部分照片已属于其他套装或已使用，请换图后整套上传')
+                            ids = []
+                            for file, current in zip(files, existing):
+                                if current:
+                                    ids.append(current['id'])
+                                    continue
+                                pid = secrets.token_hex(16)
+                                target = DATA / 'images' / pid
+                                with target.open('xb') as out:
+                                    os.chmod(target, 0o600)
+                                    out.write(file['data'])
+                                written.append(target)
+                                c.execute("INSERT INTO photos(id,name,mime,digest,size,status,created) VALUES(?,?,?,?,?,'available',?)", (pid, file['name'], file['mime'], file['digest'], len(file['data']), now()))
+                                ids.append(pid)
+                                new_ids.append(pid)
+                            package_id = secrets.token_hex(16)
+                            c.execute('INSERT INTO packages VALUES(?,?,?,?,?)', (package_id, title, text, now(), upload_id))
+                            for position, pid in enumerate(ids):
+                                c.execute('INSERT INTO package_photos VALUES(?,?,?)', (package_id, pid, position))
+                            row = c.execute('SELECT * FROM packages WHERE id=?', (package_id,)).fetchone()
+                            result = {'id': package_id, 'duplicate': False, 'package': package_data(c, row)}
+            except Exception:
+                for file in written:
+                    file.unlink(missing_ok=True)
+                raise
+            for pid in new_ids:
+                create_thumbnail(pid)
+            return self.respond(200, result)
+        if path.startswith('/api/admin/packages/') and self.command in ('PUT', 'DELETE'):
+            package_id = path.rsplit('/', 1)[-1]
+            value = self.body() if self.command == 'PUT' else None
+            removed = []
+            with database(True) as c:
+                expire(c)
+                row = c.execute('SELECT * FROM packages WHERE id=?', (package_id,)).fetchone()
+                if not row:
+                    raise Error(404, '这套图文不存在')
+                item = package_data(c, row)
+                if item['status'] != 'available':
+                    raise Error(409, '只有未领取的套装可以修改或删除，已有记录会保留')
+                if self.command == 'PUT':
+                    title, text = package_text(value)
+                    c.execute('UPDATE packages SET title=?,copy=? WHERE id=?', (title, text, package_id))
+                    item = package_data(c, c.execute('SELECT * FROM packages WHERE id=?', (package_id,)).fetchone())
+                else:
+                    removed = [p['id'] for p in item['photos']]
+                    for pid in removed:
+                        c.execute("UPDATE photos SET status='deleted' WHERE id=? AND status='available'", (pid,))
+                    c.execute('DELETE FROM package_photos WHERE package_id=?', (package_id,))
+                    c.execute('DELETE FROM packages WHERE id=?', (package_id,))
+            for pid in removed:
+                (DATA / 'images' / pid).unlink(missing_ok=True)
+                (DATA / 'thumbnails' / (pid + '.jpg')).unlink(missing_ok=True)
+            return self.respond(200, {'ok': True, 'package': item})
         if path == '/api/admin/photos' and self.command == 'GET':
             query = parse_qs(url.query)
             status = query.get('status', ['all'])[0]
@@ -548,31 +737,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = {**settings(c), 'photos': [photo(p, True) for p in rows], 'total': total, 'page': page, 'pageSize': 60, 'stats': stats}
             return self.respond(200, result)
         if path == '/api/admin/photos' and self.command == 'POST':
-            content = self.body(MAX_IMAGE, True)
-            mime = self.headers.get('Content-Type', '').split(';')[0].lower()
-            if not valid_image(content, mime):
-                raise Error(400, '照片格式或内容不完整，请重新选择JPG、PNG或WebP照片')
-            name = unquote(self.headers.get('X-File-Name', '照片')).replace('\\', '/').rsplit('/', 1)[-1]
-            name = re.sub(r'[\x00-\x1f\x7f]', '', name)[:180].strip() or '照片'
-            digest = hashlib.sha256(content).hexdigest()
-            with database(True) as c:
-                previous = c.execute('SELECT id FROM photos WHERE digest=?', (digest,)).fetchone()
-                if previous:
-                    result = {'id': previous['id'], 'duplicate': True}
-                else:
-                    pid = secrets.token_hex(16)
-                    file = DATA / 'images' / pid
-                    try:
-                        with file.open('xb') as out:
-                            os.chmod(file, 0o600)
-                            out.write(content)
-                        c.execute("INSERT INTO photos(id,name,mime,digest,size,status,created) VALUES(?,?,?,?,?,'available',?)", (pid, name, mime, digest, len(content), now()))
-                    except Exception:
-                        file.unlink(missing_ok=True)
-                        raise
-                    result = {'id': pid, 'duplicate': False}
-            create_thumbnail(result['id'])
-            return self.respond(200, result)
+            raise Error(400, '请使用整套上传：3张照片和对应文案缺一不可')
         if path.startswith('/api/admin/photos/') and self.command == 'DELETE':
             with database(True) as c:
                 expire(c)
@@ -580,6 +745,8 @@ class Handler(BaseHTTPRequestHandler):
                 p = c.execute('SELECT * FROM photos WHERE id=?', (pid,)).fetchone()
                 if not p:
                     raise Error(404, '照片不存在')
+                if c.execute('SELECT 1 FROM package_photos WHERE photo_id=?', (pid,)).fetchone():
+                    raise Error(409, '这张照片已配入套装，请按套管理')
                 if p['status'] != 'available':
                     raise Error(409, '只能删除尚未领取的可用照片，已使用记录会保留')
                 c.execute("UPDATE photos SET status='deleted' WHERE id=?", (pid,))

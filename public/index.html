@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#FFFDF8">
   <title>爱多格 · 照片领取</title>
   <link rel="icon" type="image/png" href="/aidog-photos/brand/adog-logo.png">
-  <link rel="preload" href="/aidog-photos/fonts/yahei-ui-dc3b74404496.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/aidog-photos/fonts/yahei-ui-649cf8a6bbf1.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/aidog-photos/app.css">
   <script src="/aidog-photos/guest.js" defer></script>
 </head>
@@ -21,9 +21,15 @@
       <p id="store-name" hidden>爱多格宠物医院</p>
       <div id="photo-grid" class="photo-grid" aria-label="本组照片" aria-busy="true"><div class="photo-placeholder"></div><div class="photo-placeholder"></div><div class="photo-placeholder"></div></div>
       <p id="ai-sample-note" class="ai-sample-note" hidden>AI生成示例图片</p>
-      <div id="empty-state" class="empty-state" hidden><svg viewBox="0 0 48 48" aria-hidden="true"><rect x="8" y="10" width="32" height="28" rx="7"/><circle cx="19" cy="20" r="3"/><path d="m11 34 10-10 7 7 5-5 6 7"/></svg><h2>照片正在补充</h2><p>暂时没有完整的 3 张照片，请稍后再来。</p></div>
-      <div class="download-actions"><button id="save-button" class="button primary save-button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4"/></svg><span>准备照片…</span></button><button id="next-button" class="button secondary" disabled>换一组</button></div>
-      <p id="save-hint" class="small-text photo-hint">每组 3 张，保存后即可使用。</p>
+      <div id="empty-state" class="empty-state" hidden><svg viewBox="0 0 48 48" aria-hidden="true"><rect x="8" y="10" width="32" height="28" rx="7"/><circle cx="19" cy="20" r="3"/><path d="m11 34 10-10 7 7 5-5 6 7"/></svg><h2>照片正在补充</h2><p>暂时没有可领取的图文套装，请稍后再来。</p></div>
+      <div class="download-actions"><button id="save-button" class="button primary save-button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4"/></svg><span>准备照片…</span></button><button id="next-button" class="button secondary" disabled>换一套</button></div>
+      <p id="save-hint" class="small-text photo-hint">每套 3 张，保存后即可使用。</p>
+      <section id="guest-copy-section" class="guest-copy-section" aria-label="配套文案" hidden>
+        <div class="copy-heading"><span>参考文案</span><button id="copy-button" class="button secondary compact" type="button">复制文案</button></div>
+        <p id="guest-copy" class="guest-copy collapsed"></p>
+        <button id="copy-expand" class="text-button" type="button" aria-expanded="false" hidden>展开全文</button>
+        <p class="small-text copy-note">参考文案，可按真实体验修改</p>
+      </section>
       <div id="guest-message" class="message" role="status" aria-live="polite" hidden></div>
     </section>
     <section class="platform-section" aria-labelledby="platform-heading">

@@ -23,20 +23,37 @@ def need(value, code):
         raise RuntimeError(code)
 
 
-def archive():
+def archive(reuse_full_font=False):
     files = [ROOT / 'server.py'] + sorted(path for path in (ROOT / 'public').rglob('*') if path.is_file())
     data = io.BytesIO()
     digest = hashlib.sha256()
+    reused = []
     with tarfile.open(fileobj=data, mode='w:gz') as tar:
         for path in files:
             relative = path.relative_to(ROOT).as_posix()
             need(not path.is_symlink() and not any(part.startswith('._') or part == '.DS_Store' for part in path.parts), 'unexpected_source_file')
             raw = path.read_bytes()
             digest.update(relative.encode() + b'\0' + raw + b'\0')
+            if reuse_full_font and relative == 'public/fonts/yahei.woff2':
+                reused.append({'path':relative,'sha256':hashlib.sha256(raw).hexdigest()})
+                continue
             info = tarfile.TarInfo(relative)
             info.size, info.mode, info.mtime = len(raw), 0o600, 0
             tar.addfile(info, io.BytesIO(raw))
-    return data.getvalue(), digest.hexdigest()
+    return data.getvalue(), digest.hexdigest(), reused
+
+
+def may_reuse_full_font():
+    path = ROOT / 'public/fonts/yahei.woff2'
+    if not path.is_file():
+        return False
+    expected = hashlib.sha256(path.read_bytes()).hexdigest()
+    code = "import pathlib,hashlib,json; p=pathlib.Path('/Users/liuminghao/services/aidog-photos/current/public/fonts/yahei.woff2'); print(json.dumps({'sha256':hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() and not p.is_symlink() else None}))"
+    result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', 'mac-studio', shlex.join(['/opt/homebrew/bin/python3.12','-c',code])], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    try:
+        return result.returncode == 0 and json.loads(result.stdout).get('sha256') == expected
+    except ValueError:
+        return False
 
 
 def credentials():
@@ -57,10 +74,10 @@ def main():
     args = parser.parse_args()
     value = {'mode': 'inspect'}
     if args.deploy:
-        packed, source_hash = archive()
+        packed, source_hash, reused_files = archive(may_reuse_full_font())
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         value = {'mode': 'deploy', 'archive': base64.b64encode(packed).decode(), 'archiveSha256': hashlib.sha256(packed).hexdigest(),
-                 'release': stamp + '-' + source_hash[:12], 'config': credentials()}
+                 'release': stamp + '-' + source_hash[:12], 'config': credentials(), 'reusedFiles': reused_files}
     elif args.rollback:
         value = {'mode': 'rollback', 'release': args.rollback}
     source = (ROOT / 'scripts/deploy-remote.py').read_text()

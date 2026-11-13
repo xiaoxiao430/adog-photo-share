@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path('/Library/Fonts/MicrosoftYaHei.ttf')
 if not SOURCE.is_file():
     raise SystemExit('Microsoft YaHei source font unavailable; do not substitute another family.')
-font = TTFont(SOURCE)
+font = TTFont(SOURCE, recalcTimestamp=False)
 font_family = font['name'].getDebugName(1)
 if font_family != 'Microsoft YaHei':
     raise SystemExit('Source font family mismatch.')
@@ -34,6 +34,8 @@ for path in sorted((ROOT / 'output').glob('*.json')):
     if path.name.startswith(('import-library-', 'seed-demo-')):
         material_names(json.loads(path.read_text()))
 required_text += ''.join(names)
+initial_copy = ROOT / 'content/package-copy.json'
+if initial_copy.is_file(): required_text += initial_copy.read_text()
 required = {ord(c) for c in required_text} & supported
 required |= set(range(32, 127)) & supported
 required |= {0xa0, 0x2022, 0x25cf, 0x3000} & supported
@@ -81,10 +83,11 @@ css = (ROOT / 'public/app.css').read_text()
 css = faces + '\n' + css.split('\n', 1)[1]
 css = css.replace('font-synthesis:none', 'font-synthesis:weight')
 (ROOT / 'public/app.css').write_text(css)
-html = (ROOT / 'public/index.html').read_text()
-html = re.sub(r'\n  <link rel="preload"[^>]*yahei-ui[^>]*>', '', html)
-html = html.replace('  <link rel="stylesheet"', '  <link rel="preload" href="/aidog-photos/fonts/' + font_name + '" as="font" type="font/woff2" crossorigin>\n  <link rel="stylesheet"', 1)
-(ROOT / 'public/index.html').write_text(html)
+for page_name in ['index.html', 'admin.html']:
+    html = (ROOT / 'public' / page_name).read_text()
+    html = re.sub(r'\n  <link rel="preload"[^>]*yahei-ui[^>]*>', '', html)
+    html = html.replace('  <link rel="stylesheet"', '  <link rel="preload" href="/aidog-photos/fonts/' + font_name + '" as="font" type="font/woff2" crossorigin>\n  <link rel="stylesheet"', 1)
+    (ROOT / 'public' / page_name).write_text(html)
 report = {
     'fontFamily': font_family, 'file': font_name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
     'codepoints': len(chosen), 'requiredCodepoints': len(required), 'materialNamesCovered': len(set(names)),

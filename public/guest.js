@@ -33,7 +33,7 @@
       const {headers: extraHeaders, ...requestOptions} = options;
       const headers = new Headers(extraHeaders);
       if (body !== undefined) headers.set('Content-Type', 'application/json');
-      headers.set('X-Aidog-Photo-Flow', '2');
+      headers.set('X-Aidog-Photo-Flow', '3');
       const response = await fetch(BASE + '/api' + path, {
         credentials: 'same-origin', cache: 'no-store',
         ...(body === undefined ? {} : {method: 'POST', body: JSON.stringify(body)}),
@@ -105,7 +105,7 @@
     else if (batch.status === 'used') label.textContent = '再次下载';
     else label.textContent = saveArmed && batch.status === 'reserved' ? '保存这3张' : '下载照片';
     next.disabled = busy() || !!pendingReceipt || !!pendingCancel;
-    next.textContent = batch?.status === 'used' ? '下一组' : '换一组';
+    next.textContent = batch?.status === 'used' ? '下一套' : '换一套';
     const state = $('batch-state');
     state.className = 'pill' + (batch?.status === 'used' ? ' used' : '');
     state.textContent = batch?.status === 'used' ? '已领取' : expired ? '请重新领取' : batch ? '本组 3 张' : loading ? '准备中' : '待补充';
@@ -117,7 +117,7 @@
   function expireView() {
     if (!batch || batch.status === 'used') return;
     expired = true; saveArmed = false; revokeFiles(); closeManualQuietly();
-    tell('这组照片的领取时间已到，请重新领取后再保存。'); updateButtons();
+    tell('这套照片的领取时间已到，请重新领取后再保存。'); updateButtons();
   }
   function platformCards(platforms) {
     const container = $('platforms'); container.replaceChildren();
@@ -163,6 +163,41 @@
       tile.append(button, number); grid.append(tile);
     });
   }
+  function renderCopy() {
+    const content = typeof batch?.copy === 'string' ? batch.copy : '';
+    const section = $('guest-copy-section');
+    const text = $('guest-copy');
+    const changed = text.textContent !== content;
+    section.hidden = !content;
+    text.textContent = content;
+    if (changed) {
+      text.classList.add('collapsed');
+      $('copy-expand').textContent = '展开全文';
+      $('copy-expand').setAttribute('aria-expanded', 'false');
+    }
+    $('copy-expand').hidden = content.length < 100 && content.split('\n').length <= 4;
+    $('copy-button').disabled = !content;
+  }
+  async function copyCurrentText() {
+    const text = typeof batch?.copy === 'string' ? batch.copy : '';
+    if (!text) return;
+    const button = $('copy-button'), currentId = batch.id;
+    button.disabled = true;
+    try {
+      let copied = false;
+      if (navigator.clipboard?.writeText) {
+        try { await navigator.clipboard.writeText(text); copied = true; } catch {}
+      }
+      if (!copied) {
+        const input = document.createElement('textarea'); input.value = text;
+        input.className = 'clipboard-buffer'; input.setAttribute('readonly', '');
+        document.body.append(input); input.select(); input.setSelectionRange(0, input.value.length);
+        try { copied = document.execCommand('copy'); } finally { input.remove(); }
+      }
+      if (batch?.id === currentId) tell(copied ? '文案已复制。' : '复制暂未完成，可以长按文案选择并复制。', copied ? 'success' : '');
+    } catch { tell('复制暂未完成，可以长按文案选择并复制。'); }
+    finally { button.disabled = false; }
+  }
   function applyBatch(value) {
     const valid = value && value.photos?.length === 3 ? value : null;
     const changed = photoKey(valid) !== photoKey();
@@ -170,7 +205,7 @@
     batch = valid; expired = false; loadError = false;
     if (batch?.status !== 'reserved') saveArmed = false;
     if (changed || !batch || !grid.children.length) renderPhotos();
-    updateButtons();
+    renderCopy(); updateButtons();
     return changed;
   }
   function applyBootstrap(value) {
@@ -231,7 +266,7 @@
       pendingReceipt = null; saveArmed = false;
       try { localStorage.removeItem(PENDING_KEY); } catch {}
     } catch (error) {
-      tell('保存记录暂未同步，请保留此页并重试。照片不会自动换成下一组。', 'error'); throw error;
+      tell('保存记录暂未同步，请保留此页并重试。照片不会自动换成下一套。', 'error'); throw error;
     } finally { committing = false; updateButtons(); }
   }
   async function cancelPrepared() {
@@ -241,11 +276,11 @@
       const response = await api('/batch/cancel', {batchId: id});
       pendingCancel = null;
       if (batch?.id === id) applyBootstrap(response);
-      tell('已取消，可以重新下载这组照片。');
+      tell('已取消，可以重新下载这套照片。');
     } catch (error) {
       if ([404, 409, 410].includes(error.status)) {
         pendingCancel = null; expired = true;
-        tell('这组照片已过期，请重新领取。');
+        tell('这套照片已过期，请重新领取。');
       } else tell('已取消，取消记录待同步。请连接网络后重试。', 'error');
     } finally { cancelling = false; updateButtons(); }
   }
@@ -309,7 +344,7 @@
         if (batch?.id !== id) return;
         if (!response.batch || !['reserved', 'used'].includes(response.batch.status)) throw new Error('照片暂未准备好，请重试。');
         applyBatch(response.batch);
-        if (photoKey() !== before) tell('原来的照片已被领取，已更新为新的 3 张。');
+        if (photoKey() !== before) tell('原来的图文已被领取，已换一套，请复制本套文案。');
       }
       if (!canDeliver()) { expireView(); return; }
       let originalsReady = null;
@@ -326,7 +361,7 @@
       if ([404, 409, 410].includes(error.status)) {
         preparing = false;
         await refresh(false, true);
-        tell('这组照片已被领取或已过期，页面已更新，请重新下载。');
+        tell('这套照片已被领取或已过期，页面已更新，请重新下载。');
       } else tell(error.name === 'AbortError' ? '连接超时，请重试下载。' : error.message, 'error');
     } finally { preparing = false; updateButtons(); }
   }
@@ -363,12 +398,19 @@
     prepareDownload();
   });
   next.addEventListener('click', () => refresh(true));
+  $('copy-button').addEventListener('click', copyCurrentText);
+  $('copy-expand').addEventListener('click', () => {
+    const expanded = $('copy-expand').getAttribute('aria-expanded') !== 'true';
+    $('guest-copy').classList.toggle('collapsed', !expanded);
+    $('copy-expand').setAttribute('aria-expanded', String(expanded));
+    $('copy-expand').textContent = expanded ? '收起文案' : '展开全文';
+  });
   $('manual-confirm').addEventListener('click', async () => {
     if (!canDeliver() || sharing || committing) { if (expiredNow()) expireView(); return; }
     const button = $('manual-confirm'); button.disabled = true;
     try {
       await commit('manual_confirm'); dialog.close();
-      tell('已记录这组照片的使用时间，可以前往平台上传。', 'success');
+      tell('已记录这套照片的使用时间，可以前往平台上传。', 'success');
     } catch {} finally { button.disabled = false; }
   });
   dialog.addEventListener('close', () => {

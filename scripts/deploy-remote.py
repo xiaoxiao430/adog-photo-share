@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """只管理独立 aidog-photos 服务；输入仅经 SSH stdin，不打印配置。"""
+import ast
 import base64
 import datetime
 import fcntl
@@ -41,8 +42,8 @@ def need(value, code):
         raise RuntimeError(code)
 
 
-def command(args, check=True):
-    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+def command(args, check=True, **options):
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, **options)
     if check:
         need(result.returncode == 0, 'command_failed_' + Path(args[0]).name)
     return result
@@ -181,6 +182,18 @@ def extract_release(value):
             dest.write_bytes(handle.read())
             os.chmod(dest, 0o600)
             files.append(member.name)
+    for item in value.get('reusedFiles', []):
+        relative = item.get('path')
+        need(relative == 'public/fonts/yahei.woff2' and re.fullmatch('[0-9a-f]{64}', item.get('sha256', '')), 'reuse_reference_invalid')
+        source = ROOT / 'current' / relative
+        need(source.is_file() and not source.is_symlink(), 'reuse_source_missing')
+        raw = source.read_bytes()
+        need(hashlib.sha256(raw).hexdigest() == item['sha256'], 'reuse_source_digest_changed')
+        target = release / relative
+        need(not target.exists(), 'reuse_duplicate_path')
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        private_write(target, raw)
+        files.append(relative)
     for required in ['server.py', 'public/index.html', 'public/admin.html', 'public/app.css', 'public/guest.js', 'public/admin.js', 'public/fonts/yahei.woff2']:
         need(required in files, 'archive_missing_required')
     command([PYTHON, '-c', 'import ast,pathlib; ast.parse(pathlib.Path(' + repr(str(release / 'server.py')) + ').read_text())'])
@@ -191,7 +204,9 @@ def diagnose(release):
     port = 18989
     need(not port_open(port), 'diagnostic_port_busy')
     with tempfile.TemporaryDirectory(prefix='aidog-photos-diagnostic-') as temp:
-        child = subprocess.Popen([PYTHON, str(release / 'server.py')], env=env(Path(temp) / 'data', port), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        diagnostic_env = env(Path(temp) / 'data', port)
+        diagnostic_env['AIDOG_PHOTOS_INITIAL_PACKAGES'] = str(Path(temp) / 'no-initial-packages.json')
+        child = subprocess.Popen([PYTHON, str(release / 'server.py')], env=diagnostic_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             wait_health(port)
             for route in ['/', '/admin', '/app.css', '/guest.js', '/admin.js', '/fonts/yahei.woff2']:
@@ -236,7 +251,7 @@ location ^~ /aidog-photos/ {
     proxy_connect_timeout 5s;
     proxy_read_timeout 45s;
     proxy_send_timeout 45s;
-    client_max_body_size 13m;
+    client_max_body_size 38m;
     proxy_buffering off;
     access_log off;
     add_header Referrer-Policy no-referrer always;
@@ -272,12 +287,15 @@ def remove_own_new_includes(raw, original):
 def inventory_snapshot():
     database = ROOT / 'data/photos.sqlite3'
     if not database.exists():
-        return {'columns': [], 'photos': {}, 'counts': {}, 'used': {}, 'reserved': {}, 'media': {}, 'thumbnails': {}, 'batches': {}}
+        return {'columns': [], 'photo_columns': [], 'photo_rows': {}, 'photos': {}, 'counts': {}, 'used': {}, 'reserved': {}, 'media': {}, 'thumbnails': {}, 'batches': {}, 'package_tables': {}}
     connection = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
     connection.row_factory = sqlite3.Row
     try:
+        connection.execute('BEGIN')
         need(connection.execute('PRAGMA quick_check').fetchone()[0] == 'ok', 'inventory_database_integrity')
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         columns = [row[1] for row in connection.execute('PRAGMA table_info(batches)')]
+        photo_columns = [row[1] for row in connection.execute('PRAGMA table_info(photos)')]
         rows = [dict(row) for row in connection.execute('SELECT * FROM photos ORDER BY id')]
         batches = {row['id']: dict(row) for row in connection.execute('SELECT * FROM batches')}
         static_fields = ['id', 'name', 'mime', 'digest', 'size', 'created']
@@ -285,6 +303,13 @@ def inventory_snapshot():
         used = {row['id']: {key: row[key] for key in ['status', 'used_at', 'method', 'batch_id']} for row in rows if row['status'] == 'used'}
         reserved = {row['id']: row['batch_id'] for row in rows if row['status'] == 'reserved'}
         counts = dict(connection.execute('SELECT status,count(*) FROM photos GROUP BY status'))
+        package_tables = {}
+        for table in ['packages', 'package_photos']:
+            if table in tables:
+                table_columns = [row[1] for row in connection.execute('PRAGMA table_info(' + table + ')')]
+                key = 'id' if table == 'packages' else 'photo_id'
+                table_rows = {row[key]: dict(row) for row in connection.execute('SELECT * FROM ' + table)}
+                package_tables[table] = {'columns': table_columns, 'rows': table_rows}
     finally:
         connection.close()
     media = {}
@@ -296,7 +321,18 @@ def inventory_snapshot():
         for file in (ROOT / 'data/thumbnails').iterdir():
             need(file.is_file() and not file.is_symlink(), 'thumbnail_file_shape')
             thumbnails[file.name] = hashlib.sha256(file.read_bytes()).hexdigest()
-    return {'columns': columns, 'photos': photos, 'counts': counts, 'used': used, 'reserved': reserved, 'media': media, 'thumbnails': thumbnails, 'batches': batches}
+    return {'columns': columns, 'photo_columns': photo_columns, 'photo_rows': {row['id']: row for row in rows},
+            'photos': photos, 'counts': counts, 'used': used, 'reserved': reserved,
+            'media': media, 'thumbnails': thumbnails, 'batches': batches, 'package_tables': package_tables}
+
+
+def source_schema_version(release):
+    tree = ast.parse((release / 'server.py').read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'PHOTO_SCHEMA_VERSION' for target in node.targets):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, int):
+                return node.value.value
+    return 1
 
 
 def schema_compatible(release):
@@ -305,16 +341,21 @@ def schema_compatible(release):
         return True
     connection = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
     try:
-        migrated = 'prepared_at' in {row[1] for row in connection.execute('PRAGMA table_info(batches)')}
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(batches)')}
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     finally:
         connection.close()
-    if not migrated:
-        return True
     source = (release / 'server.py').read_text()
+    if tables.intersection({'packages', 'package_photos'}) or columns.intersection({'package_id', 'copy_snapshot', 'title_snapshot'}):
+        # Flow2 can insert named batch columns but still allocate loose photos.
+        # Require an explicit schema contract as well as the package vocabulary.
+        return source_schema_version(release) >= 3 and all(name in source for name in ['packages', 'package_photos', 'package_id', 'copy_snapshot', 'title_snapshot'])
+    if 'prepared_at' not in columns:
+        return True
     return 'prepared_at' in source and re.search(r'INSERT INTO batches\s*\(', source) is not None
 
 
-def verify_inventory(before, after):
+def verify_inventory(before, after, during_init=False):
     need(before['photos'] == after['photos'], 'original_photo_rows_changed')
     need(before['media'] == after['media'], 'original_media_bytes_changed')
     need(before['thumbnails'] == after['thumbnails'], 'existing_thumbnail_bytes_changed')
@@ -326,13 +367,38 @@ def verify_inventory(before, after):
             old_batch = after['batches'].get(bid, {})
             need(old_batch.get('status') == 'preview' and old_batch.get('prepared_at') is None, 'legacy_preview_reservation_not_released')
             released += 1
+    if during_init and not migrated:
+        # This check runs while the service is stopped, so no customer write can
+        # be mistaken for a migration change to status, dates or active leases.
+        need(before['photo_columns'] == after['photo_columns'], 'photo_columns_changed_during_init')
+        need(before['photo_rows'] == after['photo_rows'], 'photo_all_columns_changed_during_init')
+        for bid, row in before['batches'].items():
+            actual = after['batches'].get(bid, {})
+            need(all(actual.get(key) == value for key, value in row.items()), 'historical_batch_changed_during_init')
+        for table, snapshot in before['package_tables'].items():
+            need(table in after['package_tables'], 'existing_package_table_missing')
+            for key, row in snapshot['rows'].items():
+                actual = after['package_tables'][table]['rows'].get(key, {})
+                need(all(actual.get(field) == value for field, value in row.items()), 'existing_package_record_changed_during_init')
+    package_schema = bool(after['package_tables']) or any(name in after['columns'] for name in ['package_id', 'copy_snapshot', 'title_snapshot'])
     return {'beforeCounts': before['counts'], 'afterCounts': after['counts'],
             'originalPhotoCount': len(before['photos']), 'currentPhotoCount': len(after['photos']),
             'originalPhotosRetained': True, 'originalMediaSha256Preserved': True,
             'existingThumbnailCount': len(before['thumbnails']), 'existingThumbnailSha256Preserved': True,
             'oldUsedCount': len(before['used']), 'oldUsedStatusAndTimePreserved': True,
             'preparedAtColumnAdded': migrated, 'legacyBrowseReservationsReleased': released,
-            'oldSevenColumnReleaseRollbackForbidden': 'prepared_at' in after['columns']}
+            'oldSevenColumnReleaseRollbackForbidden': 'prepared_at' in after['columns'],
+            'flow2ReleaseRollbackForbidden': package_schema,
+            'newPackageTables': sorted(set(after['package_tables']) - set(before['package_tables'])),
+            'packageTableCounts': {table: len(snapshot['rows']) for table, snapshot in after['package_tables'].items()},
+            'allPhotoColumnsAndHistoricalBatchesCheckedOffline': during_init and not migrated}
+
+
+def initialize_candidate(release):
+    # Apply idempotent init while the service is stopped. Verify all original
+    # columns before opening the listening socket to real customer requests.
+    code = "import runpy; candidate=runpy.run_path(" + repr(str(release / 'server.py')) + "); candidate['init']()"
+    command([PYTHON, '-c', code], env=env(ROOT / 'data', PORT))
 
 
 def switch_current(relative):
@@ -364,9 +430,10 @@ def main(value):
         release = ROOT / 'releases' / name
         need(release.is_dir() and not release.is_symlink(), 'rollback_release_missing')
         file_count = None
-        need(schema_compatible(release), 'rollback_release_incompatible_prepared_at')
+        need(schema_compatible(release), 'rollback_release_incompatible_schema')
     else:
         name, release, file_count = extract_release(value)
+    need(schema_compatible(release), 'candidate_release_incompatible_schema')
     diagnosed = diagnose(release)
     had_service = command(['launchctl', 'print', LABEL], check=False).returncode == 0
     need(had_service or not port_open(PORT), 'port_owned_by_other_service')
@@ -376,8 +443,14 @@ def main(value):
     private_write(backup / 'nginx-before.conf', old_nginx)
     if old_plist:
         private_write(backup / 'launchd-before.plist', old_plist)
+    private_write(backup / 'runtime-config-before.json', CFG.read_bytes())
+    initial_manifest = CFG.parent / 'initial-packages.json'
+    if initial_manifest.is_file():
+        private_write(backup / 'initial-packages-before.json', initial_manifest.read_bytes())
     stopped = False
     nginx_changed = False
+    migration_started = False
+    migration_validated = False
     config_before_sha = hashlib.sha256(CFG.read_bytes()).hexdigest()
     try:
         if had_service:
@@ -388,6 +461,11 @@ def main(value):
                 tar.add(ROOT / 'data', arcname='data', recursive=True)
             os.chmod(backup / 'data-before.tar.gz', 0o600)
         inventory_before = inventory_snapshot()
+        migration_started = True
+        initialize_candidate(release)
+        migration_checks = verify_inventory(inventory_before, inventory_snapshot(), during_init=True)
+        need(schema_compatible(release), 'candidate_release_incompatible_after_init')
+        migration_validated = True
         nginx_files()
         # Other projects may publish while our isolated diagnostic is running.
         # Rebase our two include additions onto the latest unrelated config.
@@ -413,16 +491,26 @@ def main(value):
             'release': name, 'previousRelease': old_link, 'publicUrl': ORIGIN + BASE + '/', 'adminUrl': ORIGIN + BASE + '/admin',
             'listen': '127.0.0.1:' + str(PORT), 'launchdLabel': LABEL, 'python': sys.version.split()[0],
             'privateConfigCreated': config_created, 'privateConfigPreserved': not config_created,
-            'archiveSha256': value.get('archiveSha256'), 'sourceFiles': file_count, 'isolatedDiagnosticPassed': diagnosed,
+            'archiveSha256': value.get('archiveSha256'), 'sourceFiles': file_count,
+            'sameShaPublicFontsReused': len(value.get('reusedFiles', [])), 'isolatedDiagnosticPassed': diagnosed,
             'nginxSyntaxPassed': True, 'nginxUnrelatedBytesPreserved': remove_own_new_includes(NGINX.read_bytes(), nginx_apply_baseline) == nginx_apply_baseline,
             'concurrentUnrelatedNginxUpdateObserved': nginx_apply_baseline != old_nginx,
             'newNamespaceOnly': True, 'oldAppDataAndConfigMutated': False, 'backup': str(backup), 'checks': statuses,
             'anonymousAdmin': status, 'phoneAlbumSaveVerified': False,
-            'inventory': inventory_checks, 'privateConfigurationByteIdentical': True}
+            'inventory': inventory_checks, 'migration': migration_checks,
+            'sourcePhotoSchemaVersion': source_schema_version(release), 'privateConfigurationByteIdentical': True,
+            'privateRuntimeAndInitialMappingBackedUp': True}
         json_write(ROOT / 'deploy-state.json', receipt)
         return receipt
     except Exception:
-        # Once prepared_at exists, seven-value INSERT code cannot safely run.
+        # The owner requested a hard stop on any post-init guard failure.
+        # Never restore an older database or silently expose an incompatible app.
+        if migration_started:
+            if command(['launchctl', 'print', LABEL], check=False).returncode == 0:
+                stop()
+            switch_current('releases/' + name)
+            raise RuntimeError('deployment_failed_after_init_service_kept_stopped')
+        # Package schemas also forbid half-compatible Flow2 loose-photo code.
         if old_link and not schema_compatible(ROOT / old_link):
             switch_current('releases/' + name)
             if command(['launchctl', 'print', LABEL], check=False).returncode != 0:

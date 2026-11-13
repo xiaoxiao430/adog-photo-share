@@ -92,8 +92,10 @@ def upload(directory, rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', required=True, type=Path, help='明确指定的AI示例PNG目录')
-    parser.add_argument('--upload', action='store_true', help='显式执行幂等入库；默认只读检查')
+    parser.add_argument('--upload', action='store_true', help='旧散图上传已停用，请在后台整套填写文案')
     args = parser.parse_args()
+    if args.upload:
+        raise shared.Failure('package_copy_required_use_admin_package_form')
     directory = args.directory.resolve()
     rows = inspect(directory)
     result = upload(directory, rows) if args.upload else {'ok': True, 'mode': 'inspect', 'count': len(rows), 'files': rows, 'mutationsPerformed': False}

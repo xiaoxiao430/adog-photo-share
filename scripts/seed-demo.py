@@ -139,10 +139,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--inspect', action='store_true', help='只读检查（默认）')
-    group.add_argument('--seed', action='store_true', help='显式上传6张示例照片')
+    group.add_argument('--seed', action='store_true', help='旧散图上传已停用，请使用三图加文案整套上传')
     args = parser.parse_args()
     inspected = inspect()
     if args.seed:
+        raise Failure('package_copy_required_use_admin_package_form')
         result = seed(inspected)
     else:
         result = {'ok': True, 'mode': 'inspect', 'count': len(inspected), 'files': inspected, 'mutationsPerformed': False}

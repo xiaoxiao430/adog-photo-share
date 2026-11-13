@@ -52,7 +52,7 @@ class Client:
 
     def request(self, method, path, value=None, raw=None, headers=None):
         supplied = dict(headers or {})
-        supplied.setdefault('X-Aidog-Photo-Flow', '2')
+        supplied.setdefault('X-Aidog-Photo-Flow', '3')
         body = raw
         if value is not None:
             body = json.dumps(value).encode()
@@ -86,46 +86,49 @@ class Client:
 
 class PhotoServerIntegration(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='aidog-photo-test-')
+        self.temp = tempfile.TemporaryDirectory(prefix='aidog-package-test-')
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.data = self.home / 'data'
-        config = self.home / 'config.json'
+        self.config = self.home / 'config.json'
         self.password = secrets.token_urlsafe(22)
         salt = secrets.token_bytes(16)
-        password_hash = hashlib.scrypt(self.password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32).hex()
-        config.write_text(json.dumps({'salt': salt.hex(), 'passwordHash': password_hash}))
-        config.chmod(0o600)
+        self.config.write_text(json.dumps({'salt': salt.hex(), 'passwordHash': hashlib.scrypt(
+            self.password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32).hex()}))
+        self.config.chmod(0o600)
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             self.port = probe.getsockname()[1]
         self.origin = f'http://localhost:{self.port}'
-        env = {**os.environ, 'AIDOG_PHOTOS_BASE': BASE, 'AIDOG_PHOTOS_ORIGIN': self.origin,
-               'AIDOG_PHOTOS_DATA': str(self.data), 'AIDOG_PHOTOS_CONFIG': str(config),
-               'AIDOG_PHOTOS_PORT': str(self.port), 'PYTHONDONTWRITEBYTECODE': '1'}
-        self.env = env
+        self.env = {**os.environ, 'AIDOG_PHOTOS_BASE': BASE, 'AIDOG_PHOTOS_ORIGIN': self.origin,
+                    'AIDOG_PHOTOS_DATA': str(self.data), 'AIDOG_PHOTOS_CONFIG': str(self.config),
+                    'AIDOG_PHOTOS_INITIAL_PACKAGES': str(self.home / 'initial-packages.json'),
+                    'AIDOG_PHOTOS_PORT': str(self.port), 'PYTHONDONTWRITEBYTECODE': '1'}
         self.log = (self.home / 'server.log').open('w+')
         self.addCleanup(self.log.close)
-        self.process = subprocess.Popen([sys.executable, str(PROJECT / 'server.py')], cwd=PROJECT,
-                                        env=env, stdout=self.log, stderr=subprocess.STDOUT)
+        self.process = None
         self.addCleanup(self.stop_server)
         self.admin = self.client()
+        self.start_server()
+        self.assertEqual(self.admin.request('POST', '/api/admin/login', {'password': self.password}).status, 200)
+
+    def start_server(self):
+        self.process = subprocess.Popen([sys.executable, str(PROJECT / 'server.py')], cwd=PROJECT,
+                                        env=self.env, stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 self.log.seek(0)
-                self.fail('Local server exited: ' + self.log.read())
+                self.fail('Disposable server exited: ' + self.log.read())
             try:
                 if self.admin.request('GET', '/api/health').status == 200:
-                    break
+                    return
             except (OSError, http.client.HTTPException):
                 time.sleep(0.025)
-        else:
-            self.fail('Local server did not start')
-        self.assertEqual(self.admin.request('POST', '/api/admin/login', {'password': self.password}).status, 200)
+        self.fail('Disposable server did not start')
 
     def stop_server(self):
-        if self.process.poll() is None:
+        if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
                 self.process.wait(timeout=4)
@@ -133,602 +136,508 @@ class PhotoServerIntegration(unittest.TestCase):
                 self.process.kill()
                 self.process.wait(timeout=4)
 
+    def restart(self):
+        self.stop_server()
+        self.start_server()
+
     def client(self):
         return Client(self.port, self.origin)
 
-    def upload(self, count, client=None):
-        actor = client or self.admin
-        results = []
-        for index in range(count):
-            content = synthetic_png()
-            response = actor.request('POST', '/api/admin/photos', raw=content,
-                                     headers={'Content-Type': 'image/png', 'X-File-Name': quote(f'合成照片-{index}.png')})
-            self.assertEqual(response.status, 200, response.data)
-            self.assertFalse(response.data['duplicate'])
-            results.append((response.data['id'], content))
-        return results
+    def sql(self, query, args=()):
+        with sqlite3.connect(self.data / 'photos.sqlite3') as c:
+            c.row_factory = sqlite3.Row
+            return [dict(row) for row in c.execute(query, args)]
 
-    def dashboard(self):
-        response = self.admin.request('GET', '/api/admin/photos')
-        self.assertEqual(response.status, 200, response.data)
-        return response.data
+    def form(self, files, fields):
+        boundary = 'aidog-test-' + secrets.token_hex(14)
+        chunks = []
+        for key, value in fields:
+            value = value if isinstance(value, bytes) else str(value).encode()
+            chunks += [f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n'.encode(), value, b'\r\n']
+        for index, file in enumerate(files):
+            name, content, mime = file
+            chunks += [f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{name}"\r\nContent-Type: {mime}\r\n\r\n'.encode(), content, b'\r\n']
+        chunks.append(f'--{boundary}--\r\n'.encode())
+        return b''.join(chunks), 'multipart/form-data; boundary=' + boundary
 
-    def bootstrap(self, client):
-        response = client.request('GET', '/api/bootstrap')
-        self.assertEqual(response.status, 200, response.data)
-        return response.data
+    def files(self, count=3):
+        return [(f'合成照片-{index}.png', synthetic_png(), 'image/png') for index in range(count)]
 
-    def commit(self, client, batch_id, method='system_share'):
-        return client.request('POST', '/api/batch/commit', {'batchId': batch_id, 'method': method})
+    def submit(self, files=None, copy='这是本地合成图片的固定参考文案，仅用于功能验证。', title='合成图文套装',
+               upload_id=None, actor=None, extra_fields=()):
+        fields = list(extra_fields)
+        if copy is not None:
+            fields.append(('copy', copy))
+        if title is not None:
+            fields.append(('title', title))
+        fields.append(('uploadId', upload_id or secrets.token_hex(12)))
+        payload, mime = self.form(self.files() if files is None else files, fields)
+        return (actor or self.admin).request('POST', '/api/admin/packages', raw=payload,
+                                            headers={'Content-Type': mime})
 
-    def prepare(self, client, batch_id):
-        response = client.request('POST', '/api/batch/prepare', {'batchId': batch_id})
-        self.assertEqual(response.status, 200, response.data)
-        self.assertEqual(response.data['batch']['status'], 'reserved')
-        self.assertEqual(len(response.data['batch']['photos']), 3)
-        return response.data['batch']
+    def create(self, index=0, files=None):
+        files = self.files() if files is None else files
+        title, copy = f'固定第{index}套', f'第{index}套固定参考文案：三张合成图片按本套顺序展示。'
+        result = self.submit(files, copy=copy, title=title)
+        self.assertEqual(result.status, 200, result.data)
+        self.assertFalse(result.data['duplicate'])
+        return result.data['package'], files
+
+    def packages(self, **query):
+        suffix = '?' + '&'.join(f'{key}={value}' for key, value in query.items()) if query else ''
+        result = self.admin.request('GET', '/api/admin/packages' + suffix)
+        self.assertEqual(result.status, 200, result.data)
+        return result.data
+
+    def photos(self):
+        result = self.admin.request('GET', '/api/admin/photos')
+        self.assertEqual(result.status, 200, result.data)
+        return result.data
+
+    def bootstrap(self, actor):
+        result = actor.request('GET', '/api/bootstrap')
+        self.assertEqual(result.status, 200, result.data)
+        return result.data['batch']
+
+    def prepare(self, actor, selected):
+        result = actor.request('POST', '/api/batch/prepare', {'batchId': selected['id']})
+        self.assertEqual(result.status, 200, result.data)
+        return result.data['batch']
+
+    def commit(self, actor, selected, method='system_share'):
+        return actor.request('POST', '/api/batch/commit', {'batchId': selected['id'], 'method': method})
+
+    def assert_snapshot(self, selected, package):
+        self.assertEqual(selected['packageId'], package['id'])
+        self.assertEqual(selected['title'], package['title'])
+        self.assertEqual(selected['copy'], package['copy'])
+        self.assertEqual([p['id'] for p in selected['photos']], [p['id'] for p in package['photos']])
+
+    def assert_empty(self):
+        self.assertEqual(self.packages()['stats']['all'], 0)
+        self.assertEqual(self.photos()['stats']['all'], 0)
+        self.assertEqual(list((self.data / 'images').iterdir()), [])
+        self.assertEqual(list((self.data / 'thumbnails').iterdir()), [])
 
     def assert_jpeg_decodes(self, payload):
-        self.assertTrue(payload.startswith(b'\xff\xd8\xff'))
-        self.assertTrue(payload.endswith(b'\xff\xd9'))
-        decoder = Path('/usr/bin/sips')
-        if not decoder.is_file():
-            self.skipTest('Native JPEG decode verification requires macOS sips')
-        source = self.home / ('preview-' + secrets.token_hex(4) + '.jpg')
-        decoded = source.with_suffix('.png')
+        self.assertTrue(payload.startswith(b'\xff\xd8\xff') and payload.endswith(b'\xff\xd9'))
+        if not Path('/usr/bin/sips').is_file():
+            self.skipTest('Native JPEG decode check needs macOS sips')
+        source = self.home / (secrets.token_hex(8) + '.jpg')
+        target = source.with_suffix('.png')
         source.write_bytes(payload)
-        result = subprocess.run([str(decoder), '-s', 'format', 'png', str(source), '--out', str(decoded)],
+        result = subprocess.run(['/usr/bin/sips', '-s', 'format', 'png', str(source), '--out', str(target)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-        self.assertEqual(result.returncode, 0, 'Native decoder could not decode JPEG preview')
-        raw = decoded.read_bytes()
-        self.assertTrue(raw.startswith(b'\x89PNG\r\n\x1a\n'))
-        width, height = struct.unpack('!II', raw[16:24])
+        self.assertEqual(result.returncode, 0)
+        decoded = target.read_bytes()
+        self.assertTrue(decoded.startswith(b'\x89PNG\r\n\x1a\n'))
+        width, height = struct.unpack('!II', decoded[16:24])
         self.assertGreater(min(width, height), 0)
         self.assertLessEqual(max(width, height), 480)
 
-    def restart_server(self):
-        self.stop_server()
-        self.process = subprocess.Popen([sys.executable, str(PROJECT / 'server.py')], cwd=PROJECT,
-                                        env=self.env, stdout=self.log, stderr=subprocess.STDOUT)
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            if self.process.poll() is not None:
-                self.log.seek(0)
-                self.fail('Local server exited on restart: ' + self.log.read())
-            try:
-                if self.admin.request('GET', '/api/health').status == 200:
-                    return
-            except (OSError, http.client.HTTPException):
-                time.sleep(0.025)
-        self.fail('Local server did not restart')
+    def test_missing_copy_or_photos_never_creates_partial_inventory(self):
+        for files, copy in [(self.files(), None), ([], '只有文案')]:
+            with self.subTest(files=len(files), missing_copy=copy is None):
+                self.assertEqual(self.submit(files, copy=copy).status, 400)
+                self.assert_empty()
 
-    def test_bulk_upload_preserves_unique_bytes_and_never_preuses(self):
-        originals = dict(self.upload(9))
-        dashboard = self.dashboard()
-        self.assertEqual(dashboard['stats'], {'available': 9, 'reserved': 0, 'used': 0, 'all': 9})
-        self.assertEqual({p['id'] for p in dashboard['photos']}, set(originals))
-        for item in dashboard['photos']:
-            self.assertIsNone(item['usedAt'])
-            response = self.admin.request('GET', '/api/admin/image/' + item['id'])
-            self.assertEqual(response.status, 200)
-            self.assertEqual(response.body, originals[item['id']])
+    def test_unicode_whitespace_and_overlong_copy_rejected_atomically(self):
+        for copy in ['', '\u3000\u2003\u00a0\n\t', '字' * 1001]:
+            with self.subTest(length=len(copy)):
+                self.assertEqual(self.submit(copy=copy).status, 400)
+                self.assert_empty()
 
-    def test_jpeg_previews_decode_for_admin_and_guest_without_changing_originals(self):
-        originals = dict(self.upload(3))
-        guest = self.client()
-        selected = self.bootstrap(guest)['batch']
-        admin_photos = {p['id']: p for p in self.dashboard()['photos']}
-        for item in selected['photos']:
-            pid = item['id']
-            self.assertEqual(item['previewUrl'], item['url'] + '?variant=preview')
-            admin_item = admin_photos[pid]
-            self.assertEqual(admin_item['previewUrl'], admin_item['url'] + '?variant=preview')
-            admin_preview = self.admin.request('GET', admin_item['previewUrl'].removeprefix(BASE))
-            guest_preview = guest.request('GET', item['previewUrl'].removeprefix(BASE))
-            self.assertEqual(admin_preview.status, 200)
-            self.assertEqual(guest_preview.status, 200)
-            self.assertEqual(dict(admin_preview.headers)['Content-Type'], 'image/jpeg')
-            self.assertEqual(dict(guest_preview.headers)['Content-Type'], 'image/jpeg')
-            self.assertEqual(admin_preview.body, guest_preview.body)
-            self.assert_jpeg_decodes(guest_preview.body)
-            for actor, url in [(guest, item['url']), (self.admin, admin_item['url'])]:
-                original = actor.request('GET', url.removeprefix(BASE))
-                self.assertEqual(original.status, 200)
-                self.assertEqual(dict(original.headers)['Content-Type'], 'image/png')
-                self.assertEqual(original.body, originals[pid])
-            self.assertEqual((self.data / 'images' / pid).read_bytes(), originals[pid])
-        dashboard = self.dashboard()
-        self.assertEqual(dashboard['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
-        self.assertTrue(all(p['usedAt'] is None for p in dashboard['photos']))
-
-    def test_preview_variants_obey_the_same_guest_and_admin_permissions(self):
-        self.upload(6)
-        owner, stranger, anonymous = self.client(), self.client(), self.client()
-        selected = self.bootstrap(owner)['batch']
-        self.bootstrap(stranger)
-        pid = selected['photos'][0]['id']
-        preview = '/api/image/' + pid + '?variant=preview'
-        self.assertEqual(anonymous.request('GET', preview).status, 401)
-        self.assertEqual(anonymous.request('GET', '/api/admin/image/' + pid + '?variant=preview').status, 401)
-        self.prepare(owner, selected['id'])
-        self.assertEqual(owner.request('GET', preview).status, 200)
-        self.assertEqual(stranger.request('GET', preview).status, 404)
-        self.assertEqual(stranger.request('GET', '/api/image/' + pid).status, 404)
-        self.assertEqual(self.commit(owner, selected['id']).status, 200)
-        self.assertEqual(owner.request('GET', preview).status, 200)
-        self.assertEqual(stranger.request('GET', preview).status, 404)
-        self.assertEqual(self.admin.request('GET', '/api/admin/image/' + pid + '?variant=preview').status, 200)
-        self.assertEqual(self.dashboard()['stats']['used'], 3)
-
-    def test_missing_preview_falls_back_to_unchanged_original_without_regeneration(self):
-        originals = dict(self.upload(3))
-        guest = self.client()
-        selected = self.bootstrap(guest)['batch']
-        item = selected['photos'][0]
-        pid = item['id']
-        thumbnail = self.data / 'thumbnails' / (pid + '.jpg')
-        self.assertTrue(thumbnail.is_file())
-        thumbnail.unlink()
-        for actor, url in [(guest, item['previewUrl']),
-                           (self.admin, BASE + '/api/admin/image/' + pid + '?variant=preview')]:
-            response = actor.request('GET', url.removeprefix(BASE))
-            self.assertEqual(response.status, 200)
-            self.assertEqual(dict(response.headers)['Content-Type'], 'image/png')
-            self.assertEqual(response.body, originals[pid])
-        self.assertFalse(thumbnail.exists(), 'Preview GET must not regenerate images')
-        self.assertEqual((self.data / 'images' / pid).read_bytes(), originals[pid])
-        dashboard = self.dashboard()
-        self.assertEqual(dashboard['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
-        self.assertTrue(all(p['usedAt'] is None for p in dashboard['photos']))
-
-    def test_preview_and_repeated_bootstrap_do_not_mark_used(self):
-        self.upload(6)
-        guest = self.client()
-        first = self.bootstrap(guest)['batch']
-        self.assertEqual(first['status'], 'preview')
-        self.assertEqual(len(first['photos']), 3)
-        for item in first['photos']:
-            response = guest.request('GET', '/api/image/' + item['id'])
-            self.assertEqual(response.status, 200)
-            self.assertTrue(response.body.startswith(b'\x89PNG'))
-        again = self.bootstrap(guest)['batch']
-        self.assertEqual(again['id'], first['id'])
-        self.assertIsNone(again['usedAt'])
-        self.assertTrue(all(p['usedAt'] is None for p in again['photos']))
-        self.assertEqual(self.dashboard()['stats'], {'available': 6, 'reserved': 0, 'used': 0, 'all': 6})
-
-    def test_concurrent_sessions_receive_disjoint_complete_groups(self):
-        self.upload(24)
-        guests = [self.client() for _ in range(8)]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(self.bootstrap, guests))
-        self.assertTrue(all(r['batch']['status'] == 'preview' for r in results))
-        self.assertTrue(all(len(r['batch']['photos']) == 3 for r in results))
-        self.assertEqual(self.dashboard()['stats'], {'available': 24, 'reserved': 0, 'used': 0, 'all': 24})
-        pairs = list(zip(guests, [r['batch']['id'] for r in results]))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            prepared = list(pool.map(lambda pair: self.prepare(*pair), pairs))
-        photo_ids = []
-        self.assertEqual(len({b['id'] for b in prepared}), 8)
-        for selected in prepared:
-            photo_ids.extend(p['id'] for p in selected['photos'])
-        self.assertEqual(len(photo_ids), len(set(photo_ids)))
-        self.assertEqual(self.dashboard()['stats']['reserved'], 24)
-        self.assertIsNone(self.bootstrap(self.client())['batch'])
-
-    def test_inventory_below_three_is_not_partially_reserved(self):
-        self.upload(2)
-        guest = self.client()
-        self.assertIsNone(self.bootstrap(guest)['batch'])
-        self.assertEqual(self.dashboard()['stats']['available'], 2)
-        self.upload(1)
-        self.assertEqual(len(self.bootstrap(guest)['batch']['photos']), 3)
-
-    def test_many_preview_visitors_do_not_exhaust_a_six_photo_library(self):
-        self.upload(6)
-        guests = [self.client() for _ in range(12)]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-            results = list(pool.map(self.bootstrap, guests))
-        self.assertTrue(all(r['batch'] and r['batch']['status'] == 'preview' for r in results))
-        self.assertTrue(all(len(r['batch']['photos']) == 3 for r in results))
-        self.assertEqual(self.dashboard()['stats'], {'available': 6, 'reserved': 0, 'used': 0, 'all': 6})
-
-    def test_stale_client_flow_must_reload_before_preview_or_renew(self):
-        self.upload(3)
-        guest = self.client()
-        preview = self.bootstrap(guest)['batch']
-        for stale in ['', '1']:
-            for method, path, body in [('GET', '/api/bootstrap', None),
-                                       ('POST', '/api/batch/renew', {'batchId': preview['id']})]:
-                with self.subTest(flow=stale, path=path):
-                    response = guest.request(method, path, body, headers={'X-Aidog-Photo-Flow': stale})
-                    self.assertEqual(response.status, 409, response.data)
-                    self.assertIs(response.data['reloadRequired'], True)
-                    self.assertIn('刷新', response.data['error'])
-                    self.assertEqual(dict(response.headers).get('Connection'), 'close')
-        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
-        self.assertEqual(self.bootstrap(guest)['batch']['status'], 'preview')
-
-    def test_preview_cannot_commit_and_renew_does_not_lock_inventory(self):
-        self.upload(3)
-        guest = self.client()
-        preview = self.bootstrap(guest)['batch']
-        self.assertEqual(self.commit(guest, preview['id']).status, 409)
-        renewed = guest.request('POST', '/api/batch/renew', {'batchId': preview['id']})
-        self.assertEqual(renewed.status, 200, renewed.data)
-        # A non-exclusive preview may keep its own page record alive, while no photo is locked.
-        self.assertGreaterEqual(renewed.data['expiresAt'], preview['expiresAt'])
-        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
-        prepared = self.prepare(guest, preview['id'])
-        short_deadline = int(time.time() * 1000) + 5000
-        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
-            connection.execute('UPDATE batches SET expires=? WHERE id=?', (short_deadline, prepared['id']))
-        renewed = guest.request('POST', '/api/batch/renew', {'batchId': prepared['id']})
-        self.assertEqual(renewed.status, 200, renewed.data)
-        self.assertGreater(renewed.data['expiresAt'], short_deadline)
-        self.assertEqual(self.dashboard()['stats']['reserved'], 3)
-
-    def test_prepare_reselects_collision_and_returns_full_authorized_snapshot(self):
-        self.upload(6)
-        first, second = self.client(), self.client()
-        preview_a, preview_b = self.bootstrap(first)['batch'], self.bootstrap(second)['batch']
-        original_b_ids = {p['id'] for p in preview_b['photos']}
-        self.assertEqual({p['id'] for p in preview_a['photos']}, original_b_ids)
-        chosen_a = self.prepare(first, preview_a['id'])
-        for pid in original_b_ids:
-            self.assertEqual(second.request('GET', '/api/image/' + pid).status, 404)
-        chosen_b = self.prepare(second, preview_b['id'])
-        self.assertFalse({p['id'] for p in chosen_a['photos']} & {p['id'] for p in chosen_b['photos']})
-        for photo in chosen_b['photos']:
-            self.assertEqual(second.request('GET', '/api/image/' + photo['id']).status, 200)
-            self.assertEqual(first.request('GET', '/api/image/' + photo['id']).status, 404)
-        self.assertEqual(self.dashboard()['stats'], {'available': 0, 'reserved': 6, 'used': 0, 'all': 6})
-
-    def test_prepare_conflict_without_another_group_cannot_duplicate_delivery(self):
-        self.upload(3)
-        first, second = self.client(), self.client()
-        a, b = self.bootstrap(first)['batch'], self.bootstrap(second)['batch']
-        a = self.prepare(first, a['id'])
-        refused = second.request('POST', '/api/batch/prepare', {'batchId': b['id']})
-        self.assertEqual(refused.status, 409, refused.data)
-        self.assertIn('换一组', refused.data['error'])
-        self.assertEqual(self.commit(second, b['id']).status, 409)
-        self.assertEqual(self.commit(first, a['id']).status, 200)
-        for p in a['photos']:
-            self.assertEqual(second.request('GET', '/api/image/' + p['id']).status, 404)
-        self.assertEqual(self.dashboard()['stats'], {'available': 0, 'reserved': 0, 'used': 3, 'all': 3})
-
-    def test_releasing_prepared_group_returns_all_photos_to_preview_pool(self):
-        self.upload(6)
-        guest = self.client()
-        selected = self.prepare(guest, self.bootstrap(guest)['batch']['id'])
-        response = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
+    def test_copy_accepts_utf8_at_boundary_and_normalizes_newlines(self):
+        response = self.submit(copy='字' * 1000)
         self.assertEqual(response.status, 200, response.data)
-        self.assertEqual(response.data['batch']['status'], 'preview')
-        self.assertFalse({p['id'] for p in response.data['batch']['photos']} & {p['id'] for p in selected['photos']})
-        self.assertEqual(self.commit(guest, selected['id']).status, 409)
-        self.assertEqual(self.dashboard()['stats'], {'available': 6, 'reserved': 0, 'used': 0, 'all': 6})
-
-    def test_single_group_can_be_previewed_again_after_switch_without_being_used(self):
-        self.upload(3)
-        guest = self.client()
-        selected = self.bootstrap(guest)['batch']
-        response = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
+        self.assertEqual(response.data['package']['copy'], '字' * 1000)
+        response = self.submit(copy='  中文正文\r\n第二行  ', title='')
         self.assertEqual(response.status, 200, response.data)
-        self.assertEqual(response.data['batch']['status'], 'preview')
-        self.assertNotEqual(response.data['batch']['id'], selected['id'])
-        self.assertEqual({p['id'] for p in response.data['batch']['photos']}, {p['id'] for p in selected['photos']})
-        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
+        self.assertEqual(response.data['package']['copy'], '中文正文\n第二行')
+        self.assertEqual(response.data['package']['title'], '中文正文')
 
-    def test_rotation_visits_all_twelve_photos_before_repeating_without_consumption(self):
-        self.upload(12)
+    def test_two_or_four_photos_rejected_without_writing_files(self):
+        for count in [2, 4]:
+            with self.subTest(count=count):
+                self.assertEqual(self.submit(self.files(count)).status, 400)
+                self.assert_empty()
+
+    def test_three_identical_photos_rejected(self):
+        file = self.files(1)[0]
+        self.assertEqual(self.submit([file, file, file]).status, 400)
+        self.assert_empty()
+
+    def test_damaged_third_image_rolls_back_entire_package(self):
+        files = self.files()
+        files[2] = ('broken.png', b'\x89PNG\r\n\x1a\n', 'image/png')
+        self.assertEqual(self.submit(files).status, 400)
+        self.assert_empty()
+
+    def test_invalid_utf8_duplicate_field_and_upload_id_rejected(self):
+        invalid = [dict(copy=b'\xff\xfe'), dict(extra_fields=[('copy', 'duplicate')]), dict(upload_id='bad')]
+        for kwargs in invalid:
+            with self.subTest(kwargs=list(kwargs)):
+                self.assertEqual(self.submit(**kwargs).status, 400)
+                self.assert_empty()
+
+    def test_valid_multipart_binds_order_copy_and_original_bytes(self):
+        package, files = self.create(7)
+        self.assertEqual(package['copy'], '第7套固定参考文案：三张合成图片按本套顺序展示。')
+        self.assertEqual([p['name'] for p in package['photos']], [f[0] for f in files])
+        for photo, (_, original, _) in zip(package['photos'], files):
+            result = self.admin.request('GET', photo['url'].removeprefix(BASE))
+            self.assertEqual(result.status, 200)
+            self.assertEqual(result.body, original)
+        self.assertEqual(self.packages()['stats'], {'available': 1, 'reserved': 0, 'used': 0, 'all': 1})
+        self.assertEqual(self.photos()['stats']['all'], 3)
+
+    def test_upload_id_retry_is_idempotent(self):
+        files, upload_id = self.files(), secrets.token_hex(12)
+        first = self.submit(files, upload_id=upload_id)
+        second = self.submit(files, upload_id=upload_id)
+        self.assertEqual(first.status, 200)
+        self.assertEqual(second.status, 200)
+        self.assertEqual(first.data['id'], second.data['id'])
+        self.assertTrue(second.data['duplicate'])
+        self.assertEqual(self.packages()['stats']['all'], 1)
+        self.assertEqual(len(list((self.data / 'images').iterdir())), 3)
+
+    def test_same_upload_id_with_changed_content_or_order_conflicts(self):
+        files, upload_id = self.files(), secrets.token_hex(12)
+        self.assertEqual(self.submit(files, upload_id=upload_id).status, 200)
+        for changed, copy in [(list(reversed(files)), '这是本地合成图片的固定参考文案，仅用于功能验证。'),
+                              (files, '已修改文案'), (self.files(), '已修改全部图片')]:
+            with self.subTest(copy=copy):
+                self.assertEqual(self.submit(changed, copy=copy, upload_id=upload_id).status, 409)
+        self.assertEqual(self.packages()['stats']['all'], 1)
+        self.assertEqual(self.photos()['stats']['all'], 3)
+
+    def test_same_three_photos_new_id_returns_existing_used_package(self):
+        package, files = self.create()
         guest = self.client()
-        selected = self.bootstrap(guest)['batch']
-        seen = set()
-        for index in range(4):
+        selected = self.prepare(guest, self.bootstrap(guest))
+        receipt = self.commit(guest, selected)
+        self.assertEqual(receipt.status, 200)
+        duplicate = self.submit(list(reversed(files)), copy='不能覆盖原文案')
+        self.assertEqual(duplicate.status, 200, duplicate.data)
+        self.assertTrue(duplicate.data['duplicate'])
+        self.assertEqual(duplicate.data['id'], package['id'])
+        self.assertEqual(duplicate.data['package']['status'], 'used')
+        self.assertEqual(duplicate.data['package']['copy'], package['copy'])
+        self.assertEqual(duplicate.data['package']['usedAt'], receipt.data['usedAt'])
+        self.assertEqual(self.photos()['stats'], {'available': 0, 'reserved': 0, 'used': 3, 'all': 3})
+
+    def test_partial_duplicate_across_packages_conflicts_atomically(self):
+        _, files = self.create()
+        self.assertEqual(self.submit([files[0], *self.files(2)]).status, 409)
+        self.assertEqual(self.packages()['stats']['all'], 1)
+        self.assertEqual(self.photos()['stats']['all'], 3)
+        self.assertEqual(len(list((self.data / 'images').iterdir())), 3)
+
+    def test_legacy_single_photo_upload_forbidden(self):
+        result = self.admin.request('POST', '/api/admin/photos', raw=synthetic_png(), headers={'Content-Type': 'image/png'})
+        self.assertEqual(result.status, 400)
+        self.assert_empty()
+
+    def test_preview_copy_and_image_reads_leave_package_available(self):
+        package, _ = self.create()
+        guests = [self.client() for _ in range(10)]
+        for actor in guests:
+            selected = self.bootstrap(actor)
+            self.assert_snapshot(selected, package)
             self.assertEqual(selected['status'], 'preview')
-            current = {photo['id'] for photo in selected['photos']}
-            self.assertEqual(len(current), 3)
-            self.assertFalse(current & seen, 'The first four groups must show twelve distinct photos')
-            seen.update(current)
-            if index < 3:
-                response = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
-                self.assertEqual(response.status, 200, response.data)
-                selected = response.data['batch']
-        self.assertEqual(len(seen), 12)
-        fifth = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
-        self.assertEqual(fifth.status, 200, fifth.data)
-        self.assertEqual(fifth.data['batch']['status'], 'preview')
-        self.assertEqual(len(fifth.data['batch']['photos']), 3)
-        self.assertTrue({photo['id'] for photo in fifth.data['batch']['photos']} <= seen)
-        dashboard = self.dashboard()
-        self.assertEqual(dashboard['stats'], {'available': 12, 'reserved': 0, 'used': 0, 'all': 12})
-        self.assertTrue(all(photo['usedAt'] is None for photo in dashboard['photos']))
+            for photo in selected['photos']:
+                self.assertEqual(actor.request('GET', photo['previewUrl'].removeprefix(BASE)).status, 200)
+            self.assertEqual(self.commit(actor, selected).status, 409)
+        self.assertEqual(self.packages()['stats']['available'], 1)
+        self.assertEqual(self.photos()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
 
-    def test_startup_migrates_legacy_preview_reservations_without_restoring_used(self):
-        self.upload(6)
-        used_guest, legacy_guest = self.client(), self.client()
-        used = self.prepare(used_guest, self.bootstrap(used_guest)['batch']['id'])
-        receipt = self.commit(used_guest, used['id'])
-        self.assertEqual(receipt.status, 200, receipt.data)
-        legacy = self.bootstrap(legacy_guest)['batch']
-        # Recreate the previous release's column layout and automatic preview reservation.
-        # All writes are confined to this test's temporary database.
-        self.stop_server()
-        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
-            connection.execute("UPDATE batches SET status='reserved' WHERE id=?", (legacy['id'],))
-            for photo in legacy['photos']:
-                connection.execute("UPDATE photos SET status='reserved',batch_id=? WHERE id=?", (legacy['id'], photo['id']))
-            connection.execute('ALTER TABLE batches DROP COLUMN prepared_at')
-        self.restart_server()
-        dashboard = self.dashboard()
-        self.assertEqual(dashboard['stats'], {'available': 3, 'reserved': 0, 'used': 3, 'all': 6})
-        self.assertEqual({p['usedAt'] for p in dashboard['photos'] if p['status'] == 'used'}, {receipt.data['usedAt']})
-        self.assertEqual(self.bootstrap(legacy_guest)['batch']['status'], 'preview')
-        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
-            self.assertEqual(connection.execute('SELECT status FROM batches WHERE id=?', (legacy['id'],)).fetchone()[0], 'preview')
-            self.assertIn('prepared_at', {r[1] for r in connection.execute('PRAGMA table_info(batches)')})
+    def test_eight_concurrent_prepares_preserve_complete_nonoverlapping_packages(self):
+        expected = {p['id']: p for p, _ in [self.create(i) for i in range(8)]}
+        guests = [self.client() for _ in range(8)]
+        previews = [self.bootstrap(g) for g in guests]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            selected = list(pool.map(lambda pair: self.prepare(*pair), zip(guests, previews)))
+        self.assertEqual(len({b['packageId'] for b in selected}), 8)
+        ids = [p['id'] for b in selected for p in b['photos']]
+        self.assertEqual(len(ids), len(set(ids)))
+        for b in selected:
+            self.assert_snapshot(b, expected[b['packageId']])
+        self.assertEqual(self.packages()['stats']['reserved'], 8)
+        self.assertEqual(self.photos()['stats']['reserved'], 24)
 
-    def test_commit_is_idempotent_and_timestamps_match_all_three(self):
-        self.upload(6)
+    def test_collision_switches_whole_package_and_matching_copy(self):
+        expected = {p['id']: p for p, _ in [self.create(1), self.create(2)]}
+        a, b = self.client(), self.client()
+        pa, pb = self.bootstrap(a), self.bootstrap(b)
+        self.assertEqual(pa['packageId'], pb['packageId'])
+        sa, sb = self.prepare(a, pa), self.prepare(b, pb)
+        self.assertNotEqual(sa['packageId'], sb['packageId'])
+        self.assertNotEqual(sa['copy'], sb['copy'])
+        self.assert_snapshot(sa, expected[sa['packageId']])
+        self.assert_snapshot(sb, expected[sb['packageId']])
+
+    def test_no_second_package_cannot_split_or_reuse_reserved_group(self):
+        self.create()
+        a, b = self.client(), self.client()
+        pa, pb = self.bootstrap(a), self.bootstrap(b)
+        self.prepare(a, pa)
+        refused = b.request('POST', '/api/batch/prepare', {'batchId': pb['id']})
+        self.assertEqual(refused.status, 409)
+        self.assertEqual(self.commit(b, pb).status, 409)
+        self.assertEqual(self.photos()['stats']['reserved'], 3)
+
+    def test_prepared_and_used_snapshots_stay_stable_and_put_is_forbidden(self):
+        package, _ = self.create()
         guest = self.client()
-        preview = self.bootstrap(guest)['batch']
-        reserved = self.prepare(guest, preview['id'])
-        first = self.commit(guest, reserved['id'])
-        self.assertEqual(first.status, 200, first.data)
-        self.assertEqual(first.data['status'], 'used')
-        self.assertGreater(first.data['usedAt'], 0)
-        second = self.commit(guest, reserved['id'], 'manual_confirm')
-        self.assertEqual(second.status, 200, second.data)
-        self.assertEqual(second.data, first.data)
-        batch = self.bootstrap(guest)['batch']
-        self.assertEqual(batch['id'], reserved['id'])
-        self.assertEqual(batch['usedAt'], first.data['usedAt'])
-        self.assertEqual({p['usedAt'] for p in batch['photos']}, {first.data['usedAt']})
-        self.assertEqual({p['status'] for p in batch['photos']}, {'used'})
-        self.assertEqual({p['method'] for p in batch['photos']}, {'system_share'})
-        self.assertEqual(self.dashboard()['stats']['used'], 3)
+        selected = self.prepare(guest, self.bootstrap(guest))
+        for state in ['reserved', 'used']:
+            if state == 'used':
+                self.assertEqual(self.commit(guest, selected).status, 200)
+            changed = self.admin.request('PUT', '/api/admin/packages/' + package['id'], {'title': '改标题', 'copy': '改正文'})
+            self.assertEqual(changed.status, 409)
+            again = self.bootstrap(guest)
+            self.assertEqual(again['status'], state)
+            self.assert_snapshot(again, package)
+            self.assertEqual(again['id'], selected['id'])
 
-    def test_other_session_cannot_read_commit_or_release_another_group(self):
-        self.upload(6)
+    def test_preview_copy_edit_is_refreshed_when_preparing_snapshot(self):
+        package, _ = self.create()
+        guest = self.client()
+        preview = self.bootstrap(guest)
+        changed = self.admin.request('PUT', '/api/admin/packages/' + package['id'], {'title': '新的固定标题', 'copy': '新的固定文案，与本套三张照片保持绑定。'})
+        self.assertEqual(changed.status, 200, changed.data)
+        selected = self.prepare(guest, preview)
+        self.assert_snapshot(selected, changed.data['package'])
+        self.assertNotEqual(selected['copy'], preview['copy'])
+
+    def test_fifteen_package_rotation_keeps_each_copy_with_its_own_three_photos(self):
+        expected = {p['id']: p for p, _ in [self.create(i) for i in range(15)]}
+        guest, seen = self.client(), set()
+        selected = self.bootstrap(guest)
+        for index in range(15):
+            self.assertNotIn(selected['packageId'], seen)
+            seen.add(selected['packageId'])
+            self.assert_snapshot(selected, expected[selected['packageId']])
+            if index < 14:
+                result = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
+                self.assertEqual(result.status, 200, result.data)
+                selected = result.data['batch']
+        again = guest.request('POST', '/api/batch/release', {'batchId': selected['id']})
+        self.assertEqual(again.status, 200)
+        self.assert_snapshot(again.data['batch'], expected[again.data['batch']['packageId']])
+        self.assertEqual(self.packages()['stats'], {'available': 15, 'reserved': 0, 'used': 0, 'all': 15})
+
+    def test_cancel_releases_whole_package_without_using_it(self):
+        package, _ = self.create()
+        guest = self.client()
+        selected = self.prepare(guest, self.bootstrap(guest))
+        cancelled = guest.request('POST', '/api/batch/cancel', {'batchId': selected['id']})
+        self.assertEqual(cancelled.status, 200)
+        self.assertEqual(cancelled.data['batch']['status'], 'preview')
+        self.assert_snapshot(cancelled.data['batch'], package)
+        self.assertEqual(self.photos()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
+
+    def test_expired_reservation_recovers_the_same_complete_package(self):
+        package, _ = self.create()
+        guest = self.client()
+        selected = self.prepare(guest, self.bootstrap(guest))
+        self.sql('UPDATE batches SET expires=0 WHERE id=?', (selected['id'],))
+        self.assertEqual(self.commit(guest, selected).status, 409)
+        replacement = self.bootstrap(self.client())
+        self.assertEqual(replacement['status'], 'preview')
+        self.assert_snapshot(replacement, package)
+        self.assertEqual(self.photos()['stats']['available'], 3)
+
+    def test_commit_is_atomic_for_three_photos_and_retry_is_idempotent(self):
+        package, _ = self.create()
+        guest = self.client()
+        selected = self.prepare(guest, self.bootstrap(guest))
+        first = self.commit(guest, selected)
+        second = self.commit(guest, selected, 'manual_confirm')
+        self.assertEqual(first.status, 200)
+        self.assertEqual(second.status, 200)
+        self.assertEqual(first.data, second.data)
+        used = self.bootstrap(guest)
+        self.assert_snapshot(used, package)
+        self.assertEqual({p['usedAt'] for p in used['photos']}, {first.data['usedAt']})
+        self.assertEqual({p['method'] for p in used['photos']}, {'system_share'})
+        self.assertIsNone(self.bootstrap(self.client()))
+
+    def test_guest_photo_and_thumbnail_permissions_match_package_ownership(self):
+        self.create()
         owner, stranger = self.client(), self.client()
-        owned = self.bootstrap(owner)['batch']
-        other = self.bootstrap(stranger)['batch']
-        self.assertNotEqual(owned['id'], other['id'])
-        owned = self.prepare(owner, owned['id'])
-        for photo in owned['photos']:
-            self.assertEqual(stranger.request('GET', '/api/image/' + photo['id']).status, 404)
-            self.assertEqual(self.client().request('GET', '/api/image/' + photo['id']).status, 401)
-        self.assertEqual(self.commit(stranger, owned['id']).status, 409)
-        self.assertEqual(stranger.request('POST', '/api/batch/prepare', {'batchId': owned['id']}).status, 409)
-        self.assertEqual(stranger.request('POST', '/api/batch/release', {'batchId': owned['id']}).status, 409)
-        self.assertEqual(self.dashboard()['stats']['used'], 0)
-        self.assertEqual(self.commit(owner, owned['id']).status, 200)
-        self.assertEqual(self.commit(stranger, owned['id']).status, 409)
+        selected = self.bootstrap(owner)
+        self.bootstrap(stranger)
+        selected = self.prepare(owner, selected)
+        for p in selected['photos']:
+            for url in [p['url'], p['previewUrl']]:
+                suffix = url.removeprefix(BASE)
+                self.assertEqual(owner.request('GET', suffix).status, 200)
+                self.assertEqual(stranger.request('GET', suffix).status, 404)
+                self.assertEqual(self.client().request('GET', suffix).status, 401)
+            self.assertEqual(self.client().request('GET', '/api/admin/image/' + p['id'] + '?variant=preview').status, 401)
+        self.assertEqual(self.commit(stranger, selected).status, 409)
+        self.assertEqual(stranger.request('POST', '/api/batch/cancel', {'batchId': selected['id']}).status, 409)
 
-    def test_cancel_release_does_not_consume_or_write_used_time(self):
-        self.upload(6)
+    def test_jpeg_thumbnail_does_not_change_original_and_missing_variant_falls_back(self):
+        package, files = self.create()
         guest = self.client()
-        first = self.bootstrap(guest)['batch']
-        response = guest.request('POST', '/api/batch/release', {'batchId': first['id']})
-        self.assertEqual(response.status, 200, response.data)
-        self.assertEqual(response.data['batch']['status'], 'preview')
-        self.assertNotEqual(response.data['batch']['id'], first['id'])
-        self.assertFalse({p['id'] for p in first['photos']} &
-                         {p['id'] for p in response.data['batch']['photos']})
-        dashboard = self.dashboard()
-        self.assertEqual(dashboard['stats'], {'available': 6, 'reserved': 0, 'used': 0, 'all': 6})
-        self.assertTrue(all(p['usedAt'] is None for p in dashboard['photos']))
-        self.assertEqual(self.commit(guest, first['id']).status, 409)
-
-    def test_used_photos_are_never_allocated_to_new_sessions(self):
-        self.upload(6)
-        first, second = self.client(), self.client()
-        old = self.bootstrap(first)['batch']
-        old = self.prepare(first, old['id'])
-        self.assertEqual(self.commit(first, old['id']).status, 200)
-        new = self.bootstrap(second)['batch']
-        new = self.prepare(second, new['id'])
-        self.assertFalse({p['id'] for p in old['photos']} & {p['id'] for p in new['photos']})
-        self.assertEqual(self.commit(second, new['id']).status, 200)
-        self.assertIsNone(self.bootstrap(self.client())['batch'])
-        self.assertEqual(self.dashboard()['stats']['used'], 6)
-
-    def test_concurrent_duplicate_uploads_create_only_one_inventory_item(self):
-        content = synthetic_png()
-        actors = [self.admin.fork() for _ in range(6)]
-        def upload_same(actor):
-            return actor.request('POST', '/api/admin/photos', raw=content, headers={'Content-Type': 'image/png'})
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            results = list(pool.map(upload_same, actors))
-        self.assertEqual([r.status for r in results], [200] * 6)
-        self.assertEqual(len({r.data['id'] for r in results}), 1)
-        self.assertEqual(sum(not r.data['duplicate'] for r in results), 1)
-        self.assertEqual(self.dashboard()['stats']['all'], 1)
-
-    def test_duplicate_digest_does_not_reenter_used_inventory(self):
-        uploaded = self.upload(3)
-        guest = self.client()
-        owned = self.bootstrap(guest)['batch']
-        owned = self.prepare(guest, owned['id'])
-        self.assertEqual(self.commit(guest, owned['id']).status, 200)
-        for pid, content in uploaded:
-            duplicate = self.admin.request('POST', '/api/admin/photos', raw=content,
-                                           headers={'Content-Type': 'image/png', 'X-File-Name': 'renamed.png'})
-            self.assertEqual(duplicate.status, 200)
-            self.assertEqual(duplicate.data, {'id': pid, 'duplicate': True})
-        self.assertEqual(self.dashboard()['stats'], {'available': 0, 'reserved': 0, 'used': 3, 'all': 3})
-        self.assertIsNone(self.bootstrap(self.client())['batch'])
-
-    def test_wrong_password_is_rejected_and_attempts_are_throttled(self):
-        outsider = self.client()
-        # The successful setup login already used one of this IP's 20 attempts.
-        statuses = [outsider.request('POST', '/api/admin/login', {'password': 'wrong-' + secrets.token_hex(4)}).status
-                    for _ in range(20)]
-        self.assertEqual(statuses[:-1], [401] * 19)
-        self.assertEqual(statuses[-1], 429)
-        self.assertEqual(outsider.request('POST', '/api/admin/login', {'password': self.password}).status, 429)
-        self.assertNotIn('aidog_photos_admin', outsider.cookies)
-        # The loopback service receives per-visitor IPs from its trusted local nginx proxy.
-        another_ip = self.client()
-        self.assertEqual(another_ip.request('POST', '/api/admin/login', {'password': self.password},
-                                            headers={'X-Real-IP': '192.0.2.20'}).status, 200)
-        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
-            connection.execute('UPDATE limits SET reset=0')
-        self.assertEqual(outsider.request('POST', '/api/admin/login', {'password': self.password}).status, 200)
+        selected = self.bootstrap(guest)
+        for photo, (_, original, _) in zip(selected['photos'], files):
+            preview = guest.request('GET', photo['previewUrl'].removeprefix(BASE))
+            self.assertEqual(preview.status, 200)
+            self.assertEqual(dict(preview.headers)['Content-Type'], 'image/jpeg')
+            admin_preview = self.admin.request('GET', '/api/admin/image/' + photo['id'] + '?variant=preview')
+            self.assertEqual(admin_preview.status, 200)
+            self.assertEqual(dict(admin_preview.headers)['Content-Type'], 'image/jpeg')
+            self.assertEqual(admin_preview.body, preview.body)
+            self.assert_jpeg_decodes(preview.body)
+            self.assertEqual(guest.request('GET', photo['url'].removeprefix(BASE)).body, original)
+            self.assertEqual((self.data / 'images' / photo['id']).read_bytes(), original)
+        photo = selected['photos'][0]
+        thumbnail = self.data / 'thumbnails' / (photo['id'] + '.jpg')
+        thumbnail.unlink()
+        fallback = guest.request('GET', photo['previewUrl'].removeprefix(BASE))
+        self.assertEqual(dict(fallback.headers)['Content-Type'], 'image/png')
+        self.assertEqual(fallback.body, files[0][1])
+        self.assertFalse(thumbnail.exists())
+        self.assertEqual(self.packages()['stats']['available'], 1)
+        self.assertEqual(self.photos()['stats']['used'], 0)
 
     def test_anonymous_admin_and_cross_site_writes_are_blocked(self):
         anonymous = self.client()
-        self.assertEqual(anonymous.request('GET', '/api/admin/photos').status, 401)
-        self.assertEqual(anonymous.request('GET', '/api/admin/session').status, 401)
-        for headers in ({'Origin': 'https://unrelated.invalid'}, {'Origin': 'null'},
-                        {'Origin': ''}, {'Sec-Fetch-Site': 'cross-site'}):
-            self.assertEqual(self.admin.request('POST', '/api/admin/photos', raw=synthetic_png(),
-                                               headers={'Content-Type': 'image/png', **headers}).status, 403)
-        self.assertEqual(self.admin.request('GET', '/api/admin/photos', headers={'Sec-Fetch-Site': 'cross-site'}).status, 403)
-        self.assertEqual(self.dashboard()['stats']['all'], 0)
+        self.assertEqual(anonymous.request('GET', '/api/admin/packages').status, 401)
+        self.assertEqual(self.submit(actor=anonymous).status, 401)
+        for origin in ['', 'null', 'https://unrelated.invalid']:
+            result = self.admin.request('PUT', '/api/admin/packages/anything', {'copy': '不应写入'}, headers={'Origin': origin})
+            self.assertEqual(result.status, 403)
+        self.assertEqual(self.admin.request('GET', '/api/admin/packages', headers={'Sec-Fetch-Site': 'cross-site'}).status, 403)
+        self.assert_empty()
 
-    def test_untrusted_platform_settings_are_atomic_and_rejected(self):
-        previous = self.dashboard()
-        good = {p['id']: p['url'] for p in previous['platforms']}
-        for malicious in ['https://meituan.com.evil.invalid/a', 'http://www.meituan.com/a',
-                          'https://user@meituan.com/a', 'https://www.meituan.com:444/a',
-                          'https://www.meituan.com\\@evil.invalid/a', 'https://meituan.com./a',
-                          'https://www.douyin.com/a', 'javascript:alert(1)',
-                          'https://www.meituan.com/a\nb']:
-            with self.subTest(url=malicious):
-                response = self.admin.request('PUT', '/api/admin/settings',
-                                              {'storeName': 'must not persist', 'platforms': {**good, 'meituan': malicious}})
-                self.assertEqual(response.status, 400, response.data)
-        current = self.dashboard()
-        self.assertEqual(current['storeName'], previous['storeName'])
-        self.assertEqual(current['platforms'], previous['platforms'])
+    def test_stale_flow_versions_must_reload_and_cannot_claim(self):
+        self.create()
+        guest = self.client()
+        selected = self.bootstrap(guest)
+        for flow in ['', '1', '2']:
+            for method, url, value in [('GET', '/api/bootstrap', None), ('POST', '/api/batch/prepare', {'batchId': selected['id']})]:
+                result = guest.request(method, url, value, headers={'X-Aidog-Photo-Flow': flow})
+                self.assertEqual(result.status, 409)
+                self.assertIs(result.data['reloadRequired'], True)
+        self.assertEqual(self.packages()['stats']['available'], 1)
+        self.assertEqual(self.photos()['stats']['reserved'], 0)
 
-    def test_valid_settings_accept_platform_official_subdomains(self):
-        links = {'meituan': 'https://dpurl.cn/test', 'dianping': 'https://m.dianping.com/shop/test',
-                 'douyin': 'https://v.douyin.com/test/'}
-        response = self.admin.request('PUT', '/api/admin/settings', {'storeName': '合成测试门店', 'platforms': links})
-        self.assertEqual(response.status, 200, response.data)
-        current = self.dashboard()
-        self.assertEqual(current['storeName'], '合成测试门店')
-        self.assertEqual({p['id']: p['url'] for p in current['platforms']}, links)
+    def test_available_package_edit_and_delete_manage_entire_group(self):
+        package, _ = self.create()
+        self.assertEqual(self.admin.request('DELETE', '/api/admin/photos/' + package['photos'][0]['id']).status, 409)
+        changed = self.admin.request('PUT', '/api/admin/packages/' + package['id'], {'title': '可用套装的新标题', 'copy': '这段新文案仍对应原来的三张照片。'})
+        self.assertEqual(changed.status, 200)
+        self.assertEqual([p['id'] for p in changed.data['package']['photos']], [p['id'] for p in package['photos']])
+        removed = self.admin.request('DELETE', '/api/admin/packages/' + package['id'])
+        self.assertEqual(removed.status, 200)
+        self.assertEqual(self.packages()['stats']['all'], 0)
+        self.assertEqual(self.photos()['stats']['all'], 0)
+        self.assertEqual(list((self.data / 'images').iterdir()), [])
 
-    def test_invalid_image_mime_and_file_bytes_are_rejected(self):
-        for mime, content in [('image/png', b'not a picture'), ('text/html', synthetic_png()),
-                              ('image/jpeg', synthetic_png()), ('image/png', b'')]:
-            with self.subTest(mime=mime, content_size=len(content)):
-                response = self.admin.request('POST', '/api/admin/photos', raw=content, headers={'Content-Type': mime})
-                self.assertEqual(response.status, 400, response.data)
-        self.assertEqual(self.dashboard()['stats']['all'], 0)
+    def test_package_pagination_and_filters_count_packages_not_photos(self):
+        for i in range(13):
+            self.create(i)
+        first, second = self.packages(), self.packages(page=2)
+        self.assertEqual(first['pageSize'], 12)
+        self.assertEqual(first['total'], 13)
+        self.assertEqual(len(first['packages']), 12)
+        self.assertEqual(len(second['packages']), 1)
+        self.assertFalse({p['id'] for p in first['packages']} & {p['id'] for p in second['packages']})
+        self.assertEqual(self.packages(status='used')['total'], 0)
 
-    def test_truncated_magic_only_png_is_not_accepted_as_a_photo(self):
-        response = self.admin.request('POST', '/api/admin/photos', raw=b'\x89PNG\r\n\x1a\n',
-                                      headers={'Content-Type': 'image/png'})
-        self.assertEqual(response.status, 400, response.data)
-        self.assertEqual(self.dashboard()['stats']['all'], 0)
-
-    def test_corrupt_png_crc_and_fake_jpeg_webp_are_rejected(self):
-        png = bytearray(synthetic_png())
-        png[29] ^= 1  # Damage IHDR CRC, retaining all normal chunk lengths.
-        for mime, content in [('image/png', bytes(png)), ('image/png', synthetic_png()[:-5]),
-                              ('image/jpeg', b'\xff\xd8\xff\xd9'),
-                              ('image/jpeg', b'\xff\xd8\xff\xe0\x00\x02\xff\xd9'),
-                              ('image/webp', b'RIFF\x04\x00\x00\x00WEBP'),
-                              ('image/webp', b'RIFF\xff\xff\xff\x7fWEBPVP8 fake')]:
-            with self.subTest(mime=mime, content_size=len(content)):
-                response = self.admin.request('POST', '/api/admin/photos', raw=content,
-                                              headers={'Content-Type': mime})
-                self.assertEqual(response.status, 400, response.data)
-        self.assertEqual(self.dashboard()['stats']['all'], 0)
-
-    def test_cookie_is_http_only_scoped_and_not_a_plaintext_database_token(self):
-        actor = self.client()
-        login = actor.request('POST', '/api/admin/login', {'password': self.password})
-        self.assertEqual(login.status, 200)
-        cookie = next(val for key, val in login.headers if key.lower() == 'set-cookie')
-        self.assertIn('HttpOnly', cookie)
-        self.assertIn('SameSite=Lax', cookie)
-        self.assertIn('Path=/aidog-photos/', cookie)
-        token = actor.cookies['aidog_photos_admin']
-        self.assertNotIn(token, login.body.decode())
-        self.assertEqual(len(token), 64)
-        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
-            sessions = [r[0] for r in connection.execute("SELECT id FROM sessions WHERE kind='admin'")]
-        self.assertNotIn(token, sessions)
-        self.assertIn(hashlib.sha256(token.encode()).hexdigest(), sessions)
-
-    def test_expired_admin_session_and_guest_cookie_cannot_authorize_admin(self):
+    def test_wrong_password_throttle_logout_and_cookie_kind_are_enforced(self):
+        outsider = self.client()
+        statuses = [outsider.request('POST', '/api/admin/login', {'password': 'wrong'}).status for _ in range(20)]
+        self.assertEqual(statuses, [401] * 19 + [429])
+        other = self.client()
+        self.assertEqual(other.request('POST', '/api/admin/login', {'password': self.password}, headers={'X-Real-IP': '192.0.2.10'}).status, 200)
         guest = self.client()
         self.bootstrap(guest)
-        self.assertEqual(guest.request('GET', '/api/admin/session').status, 401)
-        guest_token_as_admin = self.client()
-        guest_token_as_admin.cookies['aidog_photos_admin'] = guest.cookies['aidog_photos_guest']
-        self.assertEqual(guest_token_as_admin.request('GET', '/api/admin/session').status, 401)
-        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
-            connection.execute("UPDATE sessions SET expires=0 WHERE kind='admin'")
-        self.assertEqual(self.admin.request('GET', '/api/admin/photos').status, 401)
-
-    def test_path_traversal_cannot_read_source_or_external_files(self):
-        guest = self.client()
-        canonical = guest.request('GET', '/admin/')
-        self.assertEqual(canonical.status, 308)
-        self.assertEqual(dict(canonical.headers).get('Location'), BASE + '/admin')
-        for path in ['/../server.py', '/%2e%2e/server.py', '/..%2fserver.py', '/%2fetc/passwd']:
-            with self.subTest(path=path):
-                response = guest.request('GET', path)
-                self.assertEqual(response.status, 404, response.data)
-
-    def test_admin_pagination_has_consistent_totals_without_duplicates(self):
-        self.upload(64)
-        first = self.dashboard()
-        second = self.admin.request('GET', '/api/admin/photos?page=2').data
-        self.assertEqual(first['pageSize'], 60)
-        self.assertEqual(first['total'], 64)
-        self.assertEqual(second['total'], 64)
-        self.assertEqual(len(first['photos']), 60)
-        self.assertEqual(len(second['photos']), 4)
-        self.assertFalse({p['id'] for p in first['photos']} & {p['id'] for p in second['photos']})
-
-    def test_oversized_content_length_rejected_without_reading_body(self):
-        response = self.admin.request('POST', '/api/admin/photos', raw=b'',
-                                      headers={'Content-Type': 'image/png', 'Content-Length': str(12 * 1024 * 1024 + 1)})
-        self.assertEqual(response.status, 413, response.data)
-        self.assertEqual(self.dashboard()['stats']['all'], 0)
-
-    def test_expired_batch_commit_rejected_and_photos_recovered(self):
-        self.upload(3)
-        guest = self.client()
-        expired = self.bootstrap(guest)['batch']
-        expired = self.prepare(guest, expired['id'])
-        # Change only the disposable test database's clock boundary; no sleep or production writes.
-        with sqlite3.connect(self.data / 'photos.sqlite3') as connection:
-            connection.execute('UPDATE batches SET expires=? WHERE id=?', (int(time.time() * 1000) - 1000, expired['id']))
-        self.assertEqual(self.commit(guest, expired['id']).status, 409)
-        replacement = self.bootstrap(self.client())['batch']
-        self.assertIsNotNone(replacement)
-        self.assertNotEqual(replacement['id'], expired['id'])
-        self.assertEqual({p['id'] for p in replacement['photos']}, {p['id'] for p in expired['photos']})
-        self.assertEqual(guest.request('GET', '/api/image/' + expired['photos'][0]['id']).status, 404)
-        self.assertEqual(replacement['status'], 'preview')
-        self.assertEqual(self.dashboard()['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
-
-    def test_reserved_and_used_photos_cannot_be_deleted(self):
-        self.upload(3)
-        guest = self.client()
-        selected = self.bootstrap(guest)['batch']
-        selected = self.prepare(guest, selected['id'])
-        pid = selected['photos'][0]['id']
-        self.assertEqual(self.admin.request('DELETE', '/api/admin/photos/' + pid).status, 409)
-        self.assertEqual(self.commit(guest, selected['id']).status, 200)
-        self.assertEqual(self.admin.request('DELETE', '/api/admin/photos/' + pid).status, 409)
-        self.assertEqual(self.dashboard()['stats']['used'], 3)
-
-    def test_logout_revokes_cookie_session(self):
-        cookie_before = dict(self.admin.cookies)
+        guest.cookies['aidog_photos_admin'] = guest.cookies['aidog_photos_guest']
+        self.assertEqual(guest.request('GET', '/api/admin/packages').status, 401)
+        old = dict(self.admin.cookies)
         self.assertEqual(self.admin.request('POST', '/api/admin/logout', {}).status, 200)
-        self.assertNotIn('aidog_photos_admin', self.admin.cookies)
-        stolen_old = Client(self.port, self.origin, cookie_before)
-        self.assertEqual(stolen_old.request('GET', '/api/admin/session').status, 401)
+        self.assertEqual(Client(self.port, self.origin, old).request('GET', '/api/admin/packages').status, 401)
+
+    def test_platform_links_reject_untrusted_domains_atomically(self):
+        original = self.packages()
+        links = {p['id']: p['url'] for p in original['platforms']}
+        for bad in ['https://meituan.com.evil.invalid/', 'http://meituan.com/', 'https://user@meituan.com/', 'javascript:alert(1)']:
+            result = self.admin.request('PUT', '/api/admin/settings', {'storeName': '不得保存', 'platforms': {**links, 'meituan': bad}})
+            self.assertEqual(result.status, 400)
+        self.assertEqual(self.packages()['storeName'], original['storeName'])
+
+    def test_oversized_multipart_rejected_before_body_read(self):
+        result = self.admin.request('POST', '/api/admin/packages', raw=b'', headers={
+            'Content-Type': 'multipart/form-data; boundary=never', 'Content-Length': str(36 * 1024 * 1024 + 65537)})
+        self.assertEqual(result.status, 413)
+        self.assert_empty()
+
+    def test_concurrent_same_upload_id_creates_one_package_only(self):
+        files, upload_id = self.files(), secrets.token_hex(12)
+        actors = [self.admin.fork() for _ in range(4)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda actor: self.submit(files, upload_id=upload_id, actor=actor), actors))
+        self.assertEqual([r.status for r in results], [200] * 4)
+        self.assertEqual(len({r.data['id'] for r in results}), 1)
+        self.assertEqual(sum(not r.data['duplicate'] for r in results), 1)
+        self.assertEqual(self.packages()['stats']['all'], 1)
+
+    def legacy_photos(self, count, used=0):
+        ids = [secrets.token_hex(16) for _ in range(count)]
+        stamp = int(time.time() * 1000) - 600000
+        with sqlite3.connect(self.data / 'photos.sqlite3') as c:
+            for index, pid in enumerate(ids):
+                raw = synthetic_png()
+                (self.data / 'images' / pid).write_bytes(raw)
+                is_used = index < used
+                c.execute('INSERT INTO photos(id,name,mime,digest,size,status,created,used_at,method,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)', (pid, f'旧合成图-{index}.png', 'image/png', hashlib.sha256(raw).hexdigest(), len(raw), 'used' if is_used else 'available', stamp + index, stamp if is_used else None, 'manual_confirm' if is_used else None, 'legacy-batch' if is_used else None))
+        return ids, stamp
+
+    def test_old_orphan_photos_without_copy_are_not_exposed_as_packages(self):
+        self.legacy_photos(3)
+        self.assertEqual(self.photos()['stats']['available'], 3)
+        self.assertEqual(self.packages()['stats']['all'], 0)
+        self.assertIsNone(self.bootstrap(self.client()))
+
+    def test_initial_manifest_migration_preserves_45_originals_and_old_batch_once(self):
+        self.stop_server()
+        ids, used_at = self.legacy_photos(45, used=3)
+        stamp = int(time.time() * 1000)
+        with sqlite3.connect(self.data / 'photos.sqlite3') as c:
+            c.execute("INSERT INTO batches(id,session_id,status,expires,created,used_at,method,prepared_at) VALUES('legacy-batch','legacy-session','used',?,?,?,?,?)", (stamp + 100000, used_at - 1000, used_at, 'manual_confirm', used_at - 500))
+            for position, pid in enumerate(ids[:3]):
+                c.execute('INSERT INTO batch_photos VALUES(?,?,?)', ('legacy-batch', pid, position))
+            c.execute('DROP INDEX batch_package_session')
+            for column in ['package_id', 'copy_snapshot', 'title_snapshot']:
+                c.execute('ALTER TABLE batches DROP COLUMN ' + column)
+            c.execute('DROP TABLE package_photos')
+            c.execute('DROP TABLE packages')
+        before_photos = self.sql('SELECT * FROM photos ORDER BY id')
+        before_batch = self.sql("SELECT * FROM batches WHERE id='legacy-batch'")[0]
+        media = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (self.data / 'images').iterdir()}
+        manifest = {'packages': [{'key': f'initial-{i + 1:02d}', 'title': f'旧固定第{i + 1}套', 'body': f'第{i + 1}套固定参考文案。', 'photoIds': ids[i * 3:i * 3 + 3]} for i in range(15)]}
+        (self.home / 'initial-packages.json').write_text(json.dumps(manifest, ensure_ascii=False))
+        self.start_server()
+        self.assertEqual(self.packages()['stats'], {'available': 14, 'reserved': 0, 'used': 1, 'all': 15})
+        self.assertEqual(self.photos()['stats'], {'available': 42, 'reserved': 0, 'used': 3, 'all': 45})
+        for _ in range(2):
+            self.assertEqual(self.sql('SELECT * FROM photos ORDER BY id'), before_photos)
+            current_batch = self.sql("SELECT * FROM batches WHERE id='legacy-batch'")[0]
+            self.assertEqual({key: current_batch[key] for key in before_batch}, before_batch)
+            self.assertEqual({p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (self.data / 'images').iterdir()}, media)
+            self.assertEqual(len(self.sql('SELECT * FROM packages')), 15)
+            self.assertEqual(len(self.sql('SELECT * FROM package_photos')), 45)
+            self.restart()
+        first = self.packages(status='used')['packages'][0]
+        self.assertEqual(first['id'], 'initial-01')
+        self.assertEqual(first['usedAt'], used_at)
+        self.assertEqual([p['id'] for p in first['photos']], ids[:3])
 
 
 if __name__ == '__main__':
