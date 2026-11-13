@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#FFFDF8">
+  <title>爱多格 · 照片领取</title>
+  <link rel="icon" type="image/png" href="/aidog-photos/brand/adog-logo.png">
+  <link rel="stylesheet" href="/aidog-photos/app.css">
+  <script src="/aidog-photos/guest.js" defer></script>
+</head>
+<body class="guest-page">
+  <main class="guest-shell">
+    <header class="brand-header">
+      <a class="brand" href="/aidog-photos/" aria-label="爱多格照片领取首页"><img src="/aidog-photos/brand/adog-logo.png" alt="爱多格" width="94" height="52"><span class="brand-divider"></span><span>照片领取</span></a>
+      <a class="quiet-link" href="/aidog-photos/admin">管理</a>
+    </header>
+    <section class="photo-section" aria-labelledby="photos-heading">
+      <h1 id="photos-heading" class="visually-hidden">照片领取</h1><span id="batch-state" hidden>准备中</span>
+      <p id="store-name" hidden>爱多格宠物医院</p>
+      <div id="photo-grid" class="photo-grid" aria-label="本组照片" aria-busy="true"><div class="photo-placeholder"></div><div class="photo-placeholder"></div><div class="photo-placeholder"></div></div>
+      <p id="ai-sample-note" class="ai-sample-note" hidden>AI生成示例图片</p>
+      <div id="empty-state" class="empty-state" hidden><svg viewBox="0 0 48 48" aria-hidden="true"><rect x="8" y="10" width="32" height="28" rx="7"/><circle cx="19" cy="20" r="3"/><path d="m11 34 10-10 7 7 5-5 6 7"/></svg><h2>照片正在补充</h2><p>暂时没有完整的 3 张照片，请稍后再来。</p></div>
+      <div class="download-actions"><button id="save-button" class="button primary save-button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4"/></svg><span>准备照片…</span></button><button id="next-button" class="button secondary" disabled>换一组</button></div>
+      <p id="save-hint" class="small-text photo-hint">每组 3 张，保存后即可使用。</p>
+      <div id="guest-message" class="message" role="status" aria-live="polite" hidden></div>
+    </section>
+    <section class="platform-section" aria-labelledby="platform-heading">
+      <div class="step-heading"><span class="step-number">2</span><h2 id="platform-heading">去平台上传照片</h2></div>
+      <div id="platforms" class="platform-grid"></div>
+      <p class="platform-note">保存后，在对应平台自行选择照片，分享真实体验。</p>
+    </section>
+  </main>
+  <dialog id="save-dialog" class="image-dialog">
+    <div class="dialog-head"><div><span class="eyebrow">保存照片</span><h2>保存到手机</h2></div><button class="icon-button" id="close-save-dialog" aria-label="关闭保存面板">×</button></div>
+    <p class="dialog-description">长按照片，选择“保存图片”。也可以点下方的逐张下载。</p>
+    <div id="save-dialog-photos" class="save-dialog-photos"></div>
+    <button id="manual-confirm" class="button primary">我已保存这 3 张</button>
+    <p class="dialog-footnote">确认后，这组照片将记为已使用。</p>
+  </dialog>
+  <dialog id="preview-dialog" class="preview-dialog">
+    <button class="preview-close" id="close-preview" aria-label="关闭照片预览">×</button><img id="preview-image" alt="照片原图"><p>可长按保存图片</p>
+  </dialog>
+</body>
+</html>

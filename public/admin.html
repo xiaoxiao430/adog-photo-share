@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#FFFDF8">
+  <title>爱多格 · 照片管理</title>
+  <link rel="icon" type="image/png" href="/aidog-photos/brand/adog-logo.png">
+  <link rel="stylesheet" href="/aidog-photos/app.css">
+  <script src="/aidog-photos/admin.js" defer></script>
+</head>
+<body class="admin-page">
+  <div class="admin-shell">
+    <header class="brand-header admin-header"><a class="brand" href="/aidog-photos/"><img src="/aidog-photos/brand/adog-logo.png" alt="爱多格" width="94" height="52"><span class="brand-divider"></span><span>照片管理</span></a><nav class="header-actions"><a class="quiet-link qr-link" href="/aidog-photos/qr.png" target="_blank" rel="noopener">二维码</a><a class="quiet-link" href="/aidog-photos/">顾客页面 <span aria-hidden="true">↗</span></a><button id="logout" class="text-button" hidden>退出</button></nav></header>
+    <section id="login-section" class="login-panel" hidden><span class="eyebrow">门店管理</span><h1>登录照片后台</h1><p class="muted">上传门店照片，查看领取记录。</p><form id="login-form"><label for="password">管理密码</label><input id="password" name="password" type="password" autocomplete="current-password" required placeholder="请输入管理密码"><button id="login-button" class="button primary" type="submit">登录</button></form></section>
+    <main id="admin-main" hidden>
+      <div class="admin-title-row"><div><span class="eyebrow">照片库</span><h1>照片与使用记录</h1></div><button class="button secondary" id="settings-open">平台链接设置</button></div>
+      <div id="admin-message" class="message" role="status" aria-live="polite" hidden></div>
+      <section class="stats" aria-label="照片统计"><div class="stat"><span>已上传</span><strong id="stat-all">—</strong></div><div class="stat"><span>可领取</span><strong id="stat-available">—</strong></div><div class="stat"><span>领取中</span><strong id="stat-reserved">—</strong></div><div class="stat"><span>已使用</span><strong id="stat-used">—</strong></div></section>
+      <section class="upload-panel" aria-labelledby="upload-heading"><div class="upload-info"><span class="upload-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 16V4m-4 4 4-4 4 4M5 16v4h14v-4"/></svg></span><div><h2 id="upload-heading">批量上传照片</h2><p>请上传可分享的门店照片。JPG / PNG / WebP，每张不超过 12MB。</p></div></div><label class="button primary upload-label" for="photo-files">选择照片</label><input id="photo-files" class="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" multiple><div id="upload-progress" class="upload-progress" hidden><progress id="upload-bar" max="1" value="0"></progress><span id="upload-status"></span></div></section>
+      <section class="library-section" aria-labelledby="library-heading"><div class="library-toolbar"><h2 id="library-heading">全部照片</h2><div class="filter-tabs" role="group" aria-label="照片状态"><button data-filter="all" class="active" aria-pressed="true">全部</button><button data-filter="available" aria-pressed="false">可领取</button><button data-filter="reserved" aria-pressed="false">领取中</button><button data-filter="used" aria-pressed="false">已使用</button></div><button id="refresh-photos" class="text-button">刷新 ↻</button></div><div id="admin-photo-grid" class="admin-photo-grid" aria-busy="false"></div><div id="admin-empty" class="admin-empty" hidden><h3>还没有照片</h3><p>点击“选择照片”，可以一次上传多张。</p></div><nav class="pagination" aria-label="照片翻页"><span id="page-info"></span><button id="previous-page" class="button compact secondary" disabled>上一页</button><button id="next-page" class="button compact secondary" disabled>下一页</button></nav></section>
+    </main>
+    <footer class="admin-footer">使用记录按北京时间显示；同一张照片不会重复分配。</footer>
+  </div>
+  <dialog id="settings-dialog" class="settings-dialog"><div class="dialog-head"><div><span class="eyebrow">门店设置</span><h2>平台跳转链接</h2></div><button id="settings-close" class="icon-button" aria-label="关闭平台设置">×</button></div><form id="settings-form"><label for="settings-store-name">门店名称</label><input id="settings-store-name" name="storeName" type="text" required maxlength="80"><div id="settings-platform-fields"></div><p class="small-text">粘贴各平台 App 分享的完整门店链接。留空时顾客页不显示跳转按钮。</p><div id="settings-message" class="message" role="status" hidden></div><button id="settings-save" class="button primary" type="submit">保存设置</button></form></dialog>
+</body>
+</html>

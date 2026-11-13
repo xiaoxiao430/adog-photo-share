@@ -1,0 +1,14 @@
+@font-face{font-family:"Microsoft YaHei";src:url("yahei-share.woff2") format("woff2");font-weight:100 900;font-display:swap}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:#fffdf8;color:#24495a;font:15px/1.75 "Microsoft YaHei";text-align:center}
+main{width:min(100%,360px);margin:24px auto}
+.logo{width:72px;height:72px;object-fit:contain}
+h1{margin:8px 0 0;font-size:26px}
+p{margin:8px 0 18px}
+.status{margin-bottom:0;font-size:17px}
+a{display:block;padding:12px 18px;margin:10px 0;border-radius:12px;text-decoration:none;font-weight:700}
+.primary{background:#2f9fbc;color:white}
+.secondary{background:#fde8eb;color:#714354}
+a:focus-visible{outline:3px solid #24495a;outline-offset:3px}
+.qr{display:block;max-width:80%;height:auto;margin:26px auto 0}
+.caption{font-size:13px;color:#536e7b}

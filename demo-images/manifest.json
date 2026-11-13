@@ -1,0 +1,71 @@
+{
+  "description": "六张AI生成的宠物示例图，不是门店实拍或真实消费记录。用于演示三图领取。",
+  "images": [
+    {
+      "name": "AI示例_01_金毛犬.png",
+      "aiGenerated": true,
+      "style": "蓝粉宠物3D插画示例",
+      "size": 1920017,
+      "dimensions": [
+        1086,
+        1448
+      ],
+      "sha256": "f3d4af7f424408561d9da1e4dc229a3cc78c842081bb354ce493ca5096fbcd39"
+    },
+    {
+      "name": "AI示例_02_橘猫.png",
+      "aiGenerated": true,
+      "style": "蓝粉宠物3D插画示例",
+      "size": 2124896,
+      "dimensions": [
+        1086,
+        1448
+      ],
+      "sha256": "5ce833a61197195a345765c049e9aad3d1df19909b9837c6c4dc02236db7dcbf"
+    },
+    {
+      "name": "AI示例_03_比熊犬.png",
+      "aiGenerated": true,
+      "style": "蓝粉宠物3D插画示例",
+      "size": 1910259,
+      "dimensions": [
+        1086,
+        1448
+      ],
+      "sha256": "205019e5104b26eb446bda6898fcc72df1c50c02d5add4037f6348f6401e45ee"
+    },
+    {
+      "name": "AI示例_04_布偶猫.png",
+      "aiGenerated": true,
+      "style": "蓝粉宠物3D插画示例",
+      "size": 1997212,
+      "dimensions": [
+        1086,
+        1448
+      ],
+      "sha256": "0ae258cad66700c864f8f278638634245f9cbdf9ed726573bef28de12a4c8cb3"
+    },
+    {
+      "name": "AI示例_05_柯基犬.png",
+      "aiGenerated": true,
+      "style": "蓝粉宠物3D插画示例",
+      "size": 2022405,
+      "dimensions": [
+        1086,
+        1448
+      ],
+      "sha256": "4f97185e9ccab44196e3c70a939b72096b497a7cfb14b63190fae7e3eb9d6472"
+    },
+    {
+      "name": "AI示例_06_英短猫.png",
+      "aiGenerated": true,
+      "style": "蓝粉宠物3D插画示例",
+      "size": 2279230,
+      "dimensions": [
+        1086,
+        1448
+      ],
+      "sha256": "9f8830c2def14ce96d0274ccd072d5a21b6b0182260bc5fe58e0d64cabe38447"
+    }
+  ]
+}
