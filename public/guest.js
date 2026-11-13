@@ -58,6 +58,7 @@
     originals.clear(); objectUrls = []; files = []; filesKey = '';
   }
   function loadOriginal(photo, index) {
+    if (pendingReceipt) return Promise.reject(new Error('请先同步上次保存记录。'));
     const key = originalKey(photo), existing = originals.get(key);
     if (existing) return existing.promise;
     const entry = {controller: new AbortController(), file: null, url: null, promise: null};
@@ -130,13 +131,14 @@
       try { const parsed = new URL(platform.url); if (parsed.protocol === 'https:') url = parsed.href; } catch {}
       const card = document.createElement(url ? 'a' : 'div'); card.className = 'platform-card' + (url ? '' : ' disabled');
       if (url) { card.href = url; card.rel = 'noopener noreferrer'; }
-      const icon = document.createElement('img'); icon.src = BASE + '/brand/' + id + '.png'; icon.alt = ''; icon.width = 36; icon.height = 36;
+      const icon = document.createElement('img'); icon.src = BASE + '/brand/' + id + '-small.png'; icon.alt = ''; icon.width = 36; icon.height = 36;
       const title = document.createElement('span'); title.textContent = names[id];
       const hint = document.createElement('span'); hint.className = 'platform-arrow'; hint.textContent = url ? '打开平台 ↗' : '链接待设置';
       card.append(icon, title, hint); container.append(card);
     });
   }
   function preview(photo) {
+    if (pendingReceipt) { tell('上次保存记录尚未同步，请先点按钮重试。'); return; }
     const element = $('preview-image'), previewDialog = $('preview-dialog');
     const cached = originalEntry(photo);
     element.src = cached?.url || photo.previewUrl || photo.url;
@@ -269,6 +271,24 @@
       tell('保存记录暂未同步，请保留此页并重试。照片不会自动换成下一套。', 'error'); throw error;
     } finally { committing = false; updateButtons(); }
   }
+  async function retryPendingReceipt() {
+    if (!pendingReceipt || busy()) return false;
+    const record = {...pendingReceipt};
+    committing = true; updateButtons();
+    try {
+      const result = await api('/batch/commit', record);
+      if (result.status !== 'used') throw new Error('保存记录暂未确认。');
+      if (batch?.id === record.batchId) Object.assign(batch, {status: 'used', usedAt: result.usedAt, method: result.method || record.method});
+      pendingReceipt = null; saveArmed = false;
+      try { localStorage.removeItem(PENDING_KEY); } catch {}
+      tell('上次保存记录已同步。', 'success');
+      return true;
+    } catch (error) {
+      if ([404, 409, 410].includes(error.status)) tell('上次保存记录需要门店核对，记录已保留。当前可查看图文，暂不能下载或换套。', 'error');
+      else tell('上次保存记录暂未同步，已保留记录。请连接网络后点按钮重试。', 'error');
+      return false;
+    } finally { committing = false; updateButtons(); }
+  }
   async function cancelPrepared() {
     if (cancelling || pendingReceipt || committing || (!pendingCancel && batch?.status !== 'reserved')) return;
     const id = pendingCancel || batch.id; pendingCancel = id; cancelling = true; saveArmed = false; updateButtons();
@@ -285,6 +305,7 @@
     } finally { cancelling = false; updateButtons(); }
   }
   function manualPanel(prepareOriginals = true) {
+    if (pendingReceipt) { tell('请先同步上次保存记录。'); return; }
     if (!canDeliver()) { expireView(); return; }
     const panel = $('save-dialog-photos'), key = photoKey(), photos = [...batch.photos];
     const rows = [];
@@ -320,7 +341,7 @@
     else finish(false);
   }
   function startSystemShare() {
-    if (!canDeliver() || !canShare() || sharing) return;
+    if (pendingReceipt || !canDeliver() || !canShare() || sharing) return;
     const id = batch.id; sharing = true; saveArmed = false; updateButtons();
     // A reserved snapshot already owns all three photos. Do not await network here.
     renew();
@@ -336,7 +357,7 @@
     }).finally(() => { sharing = false; updateButtons(); });
   }
   async function prepareDownload() {
-    if (!batch || busy()) return;
+    if (!batch || busy() || pendingReceipt) return;
     const id = batch.id, before = photoKey(); preparing = true; updateButtons(); tell('');
     try {
       if (batch.status === 'preview') {
@@ -369,12 +390,9 @@
     if (busy() || dialog.open) return;
     loading = true; updateButtons(); if (!silent) tell('');
     try {
-      if (pendingReceipt) {
-        try {
-          await api('/batch/commit', pendingReceipt);
-          pendingReceipt = null; try { localStorage.removeItem(PENDING_KEY); } catch {}
-        } catch (error) { tell('上次保存记录还未同步，请保持网络连接后重试。', 'error'); throw error; }
-      }
+      // Display the current snapshot independently of an older unsynced receipt.
+      // Delivery and switching stay disabled until the old commit is confirmed.
+      if (pendingReceipt) replace = false;
       let response;
       try { response = await api(replace && batch ? '/batch/release' : '/bootstrap', replace && batch ? {batchId: batch.id} : undefined); }
       catch (error) {
@@ -382,6 +400,7 @@
         else throw error;
       }
       pendingCancel = null; applyBootstrap(response); saveArmed = false;
+      if (pendingReceipt) tell('上次保存记录尚未同步。图文可以查看，下载和换套需先点按钮同步记录。');
     } catch (error) {
       if (!silent || !message.textContent) tell(error.name === 'AbortError' ? '连接超时，请重试。' : error.message, 'error');
       if (!batch && !pendingReceipt) loadError = true;
@@ -389,7 +408,7 @@
   }
   save.addEventListener('click', () => {
     if (busy()) return;
-    if (pendingReceipt) { refresh(); return; }
+    if (pendingReceipt) { retryPendingReceipt(); return; }
     if (pendingCancel) { cancelPrepared(); return; }
     if (expired || expiredNow() || loadError) { refresh(); return; }
     if (!batch) return;
@@ -406,6 +425,7 @@
     $('copy-expand').textContent = expanded ? '收起文案' : '展开全文';
   });
   $('manual-confirm').addEventListener('click', async () => {
+    if (pendingReceipt) { if (await retryPendingReceipt()) dialog.close(); return; }
     if (!canDeliver() || sharing || committing) { if (expiredNow()) expireView(); return; }
     const button = $('manual-confirm'); button.disabled = true;
     try {
@@ -422,7 +442,7 @@
   [dialog, $('preview-dialog')].forEach(element => element.addEventListener('click', event => { if (event.target === element) { const r = element.getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) element.close(); } }));
   function foreground() {
     if (document.hidden || busy()) return;
-    if (pendingReceipt) { refresh(false, true); return; }
+    if (pendingReceipt) { if (!batch || loadError) refresh(false, true); else retryPendingReceipt(); return; }
     if (pendingCancel) { cancelPrepared(); return; }
     if (!batch || (batch.status === 'preview' && (expired || expiredNow()))) refresh(false, true);
     else if (expiredNow()) expireView();
@@ -438,7 +458,7 @@
         else expireView();
       } else renew();
     }, 45000);
-    emptyPoll = setInterval(() => { if (!document.hidden && !batch && !busy() && !pendingReceipt && !pendingCancel) refresh(false, true); }, 8000);
+    emptyPoll = setInterval(() => { if (!document.hidden && !batch && !busy() && !pendingCancel) refresh(false, true); }, 8000);
   }
   document.addEventListener('visibilitychange', foreground);
   window.addEventListener('online', foreground);

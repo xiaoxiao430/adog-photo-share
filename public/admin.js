@@ -240,7 +240,7 @@
     const platforms = platformList();
     Object.entries(names).forEach(([id, name]) => {
       const label = document.createElement('label'); label.htmlFor = 'platform-' + id; label.className = 'field-heading';
-      const icon = document.createElement('img'); icon.src = BASE + '/brand/' + id + '.png'; icon.alt = '';
+      const icon = document.createElement('img'); icon.src = BASE + '/brand/' + id + '-small.png'; icon.alt = '';
       label.append(icon, document.createTextNode(name));
       const input = document.createElement('input'); input.id = 'platform-' + id; input.name = id; input.type = 'url'; input.inputMode = 'url'; input.placeholder = 'https://…'; input.value = platforms.find(item => item.id === id)?.url || '';
       fields.append(label, input);

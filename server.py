@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """独立照片领取服务。仅标准库；数据和登录配置均位于源码目录之外。"""
+import gzip
 import hashlib
 import hmac
 import ipaddress
@@ -345,6 +346,29 @@ def package_text(value):
     return title.strip() or text.split('\n', 1)[0][:18], text
 
 
+def accepts_gzip(header):
+    qualities = {}
+    for entry in (header or '').split(','):
+        parts = entry.split(';')
+        coding = parts[0].strip().lower()
+        if coding not in ('gzip', '*'):
+            continue
+        weights = [part.partition('=')[2].strip() for part in parts[1:]
+                   if part.partition('=')[0].strip().lower() == 'q']
+        quality = 1.0
+        if weights:
+            quality = (float(weights[0]) if len(weights) == 1 and
+                       re.fullmatch(r'(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)', weights[0]) else 0.0)
+        # An explicit refusal wins over a wildcard or a repeated coding entry.
+        qualities[coding] = min(qualities.get(coding, quality), quality)
+    return qualities.get('gzip', qualities.get('*', 0.0)) > 0
+
+
+def matches_etag(header, etag):
+    return any(value.strip() == '*' or value.strip().removeprefix('W/') == etag
+               for value in (header or '').split(','))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'AidogPhotos/1'
     protocol_version = 'HTTP/1.1'
@@ -354,21 +378,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def respond(self, status, payload, mime='application/json; charset=utf-8', headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode() if not isinstance(payload, bytes) else payload
+        headers = dict(headers or {})
+        cache = headers.pop('Cache-Control', 'no-store')
+        if urlsplit(self.path).path.startswith(BASE + '/api/'):
+            cache = 'no-store'
         self.send_response(status)
-        self.send_header('Content-Type', mime)
-        self.send_header('Content-Length', str(len(body)))
-        cache = 'no-store' if '/api/' in self.path else 'public, max-age=86400' if self.path.endswith(('.woff2', '.png')) else 'no-cache'
+        if status != 304:
+            self.send_header('Content-Type', mime)
+            self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', cache)
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'same-origin')
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' blob: data:; style-src 'self'; script-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-        for k, v in (headers or {}).items():
+        for k, v in headers.items():
             self.send_header(k, v)
         for cookie in getattr(self, 'cookies_out', []):
             self.send_header('Set-Cookie', cookie)
         self.end_headers()
-        self.wfile.write(body)
+        if status != 304:
+            self.wfile.write(body)
+
+    def static_file(self, file):
+        body = file.read_bytes()
+        compressible = file.suffix.lower() in ('.html', '.js', '.css')
+        headers = {'Cache-Control': 'no-cache'}
+        if re.fullmatch(r'.+-[a-f0-9]{8,64}\.woff2', file.name):
+            headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+        elif file.suffix.lower() in ('.woff2', '.png'):
+            headers['Cache-Control'] = 'public, max-age=86400'
+        if compressible:
+            headers['Vary'] = 'Accept-Encoding'
+            if accepts_gzip(self.headers.get('Accept-Encoding')):
+                body = gzip.compress(body, compresslevel=6, mtime=0)
+                headers['Content-Encoding'] = 'gzip'
+        etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+        headers['ETag'] = etag
+        if matches_etag(self.headers.get('If-None-Match'), etag):
+            return self.respond(304, b'', headers=headers)
+        return self.respond(200, body, mimetypes.guess_type(str(file))[0] or 'application/octet-stream', headers)
 
     def body(self, maximum=16384, raw=False):
         try:
@@ -591,7 +639,7 @@ class Handler(BaseHTTPRequestHandler):
             file = (ROOT / 'public' / name).resolve()
             if not file.is_relative_to(ROOT / 'public') or not file.is_file():
                 raise Error(404, '页面不存在')
-            return self.respond(200, file.read_bytes(), mimetypes.guess_type(str(file))[0] or 'application/octet-stream')
+            return self.static_file(file)
         except Error as e:
             self.close_connection = True
             self.respond(e.status, {'error': e.message}, headers={'Connection': 'close'})
