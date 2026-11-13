@@ -272,7 +272,7 @@ def remove_own_new_includes(raw, original):
 def inventory_snapshot():
     database = ROOT / 'data/photos.sqlite3'
     if not database.exists():
-        return {'columns': [], 'photos': {}, 'counts': {}, 'used': {}, 'reserved': {}, 'media': {}, 'batches': {}}
+        return {'columns': [], 'photos': {}, 'counts': {}, 'used': {}, 'reserved': {}, 'media': {}, 'thumbnails': {}, 'batches': {}}
     connection = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -291,7 +291,12 @@ def inventory_snapshot():
     for file in (ROOT / 'data/images').iterdir():
         need(file.is_file() and not file.is_symlink(), 'media_file_shape')
         media[file.name] = hashlib.sha256(file.read_bytes()).hexdigest()
-    return {'columns': columns, 'photos': photos, 'counts': counts, 'used': used, 'reserved': reserved, 'media': media, 'batches': batches}
+    thumbnails = {}
+    if (ROOT / 'data/thumbnails').exists():
+        for file in (ROOT / 'data/thumbnails').iterdir():
+            need(file.is_file() and not file.is_symlink(), 'thumbnail_file_shape')
+            thumbnails[file.name] = hashlib.sha256(file.read_bytes()).hexdigest()
+    return {'columns': columns, 'photos': photos, 'counts': counts, 'used': used, 'reserved': reserved, 'media': media, 'thumbnails': thumbnails, 'batches': batches}
 
 
 def schema_compatible(release):
@@ -312,6 +317,7 @@ def schema_compatible(release):
 def verify_inventory(before, after):
     need(before['photos'] == after['photos'], 'original_photo_rows_changed')
     need(before['media'] == after['media'], 'original_media_bytes_changed')
+    need(before['thumbnails'] == after['thumbnails'], 'existing_thumbnail_bytes_changed')
     need(all(after['used'].get(pid) == record for pid, record in before['used'].items()), 'old_used_record_changed')
     migrated = 'prepared_at' not in before['columns'] and 'prepared_at' in after['columns']
     released = 0
@@ -323,6 +329,7 @@ def verify_inventory(before, after):
     return {'beforeCounts': before['counts'], 'afterCounts': after['counts'],
             'originalPhotoCount': len(before['photos']), 'currentPhotoCount': len(after['photos']),
             'originalPhotosRetained': True, 'originalMediaSha256Preserved': True,
+            'existingThumbnailCount': len(before['thumbnails']), 'existingThumbnailSha256Preserved': True,
             'oldUsedCount': len(before['used']), 'oldUsedStatusAndTimePreserved': True,
             'preparedAtColumnAdded': migrated, 'legacyBrowseReservationsReleased': released,
             'oldSevenColumnReleaseRollbackForbidden': 'prepared_at' in after['columns']}

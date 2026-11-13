@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import struct
+import subprocess
 import time
 import zlib
 from contextlib import contextmanager
@@ -64,6 +65,7 @@ def init():
     DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(DATA, 0o700)
     (DATA / 'images').mkdir(exist_ok=True, mode=0o700)
+    (DATA / 'thumbnails').mkdir(exist_ok=True, mode=0o700)
     with database(True) as c:
         c.executescript('''
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,kind TEXT NOT NULL,expires INTEGER NOT NULL,current_batch TEXT);
@@ -104,7 +106,8 @@ def settings(c):
 
 
 def photo(p, admin=False):
-    return {'id': p['id'], 'name': p['name'], 'url': BASE + ('/api/admin/image/' if admin else '/api/image/') + p['id'],
+    url = BASE + ('/api/admin/image/' if admin else '/api/image/') + p['id']
+    return {'id': p['id'], 'name': p['name'], 'url': url, 'previewUrl': url + '?variant=preview',
             'status': p['status'], 'createdAt': p['created'], 'usedAt': p['used_at'], 'method': p['method'], 'batchId': p['batch_id']}
 
 
@@ -250,6 +253,36 @@ def valid_image(data, mime):
     except (IndexError, ValueError, struct.error):
         return False
     return False
+
+
+def create_thumbnail(pid):
+    """Build once on upload; preview GET never decodes or recompresses images."""
+    source = DATA / 'images' / pid
+    target = DATA / 'thumbnails' / (pid + '.jpg')
+    if target.is_file():
+        return True
+    temporary = target.with_name('.' + pid + '-' + secrets.token_hex(4) + '.jpg')
+    try:
+        if Path('/usr/bin/sips').is_file():
+            subprocess.run(['/usr/bin/sips', '-s', 'format', 'jpeg', '-s', 'formatOptions', '68', '-Z', '480', str(source), '--out', str(temporary)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True)
+        else:
+            # Optional portability fallback. The deployed Mac uses built-in sips.
+            from PIL import Image, ImageOps
+            with Image.open(source) as original:
+                image = ImageOps.exif_transpose(original).convert('RGB')
+                image.thumbnail((480, 480))
+                image.save(temporary, 'JPEG', quality=68, optimize=True)
+        content = temporary.read_bytes()
+        if not valid_image(content, 'image/jpeg') or len(content) > 512 * 1024:
+            return False
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+        return True
+    except (OSError, ImportError, ValueError, subprocess.SubprocessError):
+        return False
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -450,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
                     p = c.execute("SELECT p.* FROM photos p JOIN batch_photos bp ON bp.photo_id=p.id JOIN batches b ON b.id=bp.batch_id WHERE p.id=? AND b.session_id=? AND ((b.status='preview' AND p.status='available') OR (b.status IN ('reserved','used') AND p.batch_id=b.id))", (pid, sid)).fetchone()
                     if not p:
                         raise Error(404, '照片不存在或页面已过期')
-                return self.image(p)
+                return self.image(p, parse_qs(url.query).get('variant', [''])[0] == 'preview')
             if path.startswith('/api/'):
                 raise Error(404, '接口不存在')
             if self.command != 'GET':
@@ -469,11 +502,15 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.respond(500, {'error': '暂时无法完成，请稍后重试'}, headers={'Connection': 'close'})
 
-    def image(self, p):
+    def image(self, p, preview=False):
         file = DATA / 'images' / p['id']
+        mime = p['mime']
+        thumbnail = DATA / 'thumbnails' / (p['id'] + '.jpg')
+        if preview and thumbnail.is_file():
+            file, mime = thumbnail, 'image/jpeg'
         if not file.is_file():
             raise Error(404, '照片文件暂不可用')
-        self.respond(200, file.read_bytes(), p['mime'])
+        self.respond(200, file.read_bytes(), mime)
 
     def admin(self, path, url):
         if path == '/api/admin/session' and self.command == 'GET':
@@ -490,7 +527,7 @@ class Handler(BaseHTTPRequestHandler):
                 p = c.execute("SELECT * FROM photos WHERE id=? AND status!='deleted'", (path.rsplit('/', 1)[-1],)).fetchone()
                 if not p:
                     raise Error(404, '照片不存在')
-            return self.image(p)
+            return self.image(p, parse_qs(url.query).get('variant', [''])[0] == 'preview')
         if path == '/api/admin/photos' and self.command == 'GET':
             query = parse_qs(url.query)
             status = query.get('status', ['all'])[0]
@@ -534,6 +571,7 @@ class Handler(BaseHTTPRequestHandler):
                         file.unlink(missing_ok=True)
                         raise
                     result = {'id': pid, 'duplicate': False}
+            create_thumbnail(result['id'])
             return self.respond(200, result)
         if path.startswith('/api/admin/photos/') and self.command == 'DELETE':
             with database(True) as c:
@@ -546,6 +584,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise Error(409, '只能删除尚未领取的可用照片，已使用记录会保留')
                 c.execute("UPDATE photos SET status='deleted' WHERE id=?", (pid,))
             (DATA / 'images' / pid).unlink(missing_ok=True)
+            (DATA / 'thumbnails' / (pid + '.jpg')).unlink(missing_ok=True)
             return self.respond(200, {'ok': True})
         if path == '/api/admin/settings' and self.command == 'PUT':
             value = self.body()

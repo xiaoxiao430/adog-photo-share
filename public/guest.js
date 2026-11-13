@@ -8,7 +8,8 @@
   let batch = null, files = [], objectUrls = [], filesKey = '';
   let loading = false, preparing = false, sharing = false, committing = false, cancelling = false;
   let expired = false, loadError = false, saveArmed = false, pendingCancel = null;
-  let photoController = null, prefetchPromise = null, loadGeneration = 0, renewInFlight = null;
+  const originals = new Map();
+  let prefetchPromise = null, loadGeneration = 0, renewInFlight = null;
   let heartbeat = null, emptyPoll = null, suppressDialogCancel = false;
   let pendingReceipt = null;
   try {
@@ -49,11 +50,38 @@
   function expiredNow() { return !!batch && batch.status !== 'used' && dateNumber(batch.expiresAt) <= Date.now() + 2500; }
   function photoKey(value = batch) { return value ? value.id + ':' + value.photos.map(photo => photo.id).join(',') : ''; }
   function canDeliver() { return !!batch && ['reserved', 'used'].includes(batch.status) && !expired && !expiredNow(); }
+  function originalKey(photo) { return photo.id + ':' + photo.url; }
+  function originalEntry(photo) { return originals.get(originalKey(photo)); }
   function revokeFiles() {
-    loadGeneration++;
-    photoController?.abort(); photoController = null; prefetchPromise = null;
-    objectUrls.forEach(url => URL.revokeObjectURL(url));
-    objectUrls = []; files = []; filesKey = '';
+    loadGeneration++; prefetchPromise = null;
+    originals.forEach(entry => { entry.controller.abort(); if (entry.url) URL.revokeObjectURL(entry.url); });
+    originals.clear(); objectUrls = []; files = []; filesKey = '';
+  }
+  function loadOriginal(photo, index) {
+    const key = originalKey(photo), existing = originals.get(key);
+    if (existing) return existing.promise;
+    const entry = {controller: new AbortController(), file: null, url: null, promise: null};
+    originals.set(key, entry);
+    const timer = setTimeout(() => entry.controller.abort(), 24000);
+    entry.promise = (async () => {
+      try {
+        const response = await fetch(photo.url, {credentials: 'same-origin', signal: entry.controller.signal});
+        if (!response.ok) throw new Error('照片暂未准备好。');
+        const type = (response.headers.get('Content-Type') || '').split(';')[0].trim();
+        const ext = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp'}[type];
+        if (!ext) throw new Error('图片格式暂不支持整组保存。');
+        const blob = await response.blob();
+        if (!blob.size || blob.size > 12 * 1024 * 1024) throw new Error('图片较大，可以逐张下载。');
+        if (originals.get(key) !== entry) throw new Error('照片已切换。');
+        entry.file = new File([blob], '爱多格-' + (index + 1) + '.' + ext, {type});
+        entry.url = URL.createObjectURL(entry.file);
+        return entry;
+      } catch (error) {
+        if (originals.get(key) === entry) originals.delete(key);
+        throw error;
+      } finally { clearTimeout(timer); }
+    })();
+    return entry.promise;
   }
   function updateHint() {
     if (!batch) $('save-hint').textContent = '请稍后重试，或联系门店补充照片。';
@@ -109,9 +137,17 @@
     });
   }
   function preview(photo) {
-    $('preview-image').src = photo.url; $('preview-image').alt = photo.name || '照片预览';
-    $('preview-dialog').querySelector('p').textContent = canDeliver() ? '可长按保存图片' : '照片预览，下载请返回页面点“下载照片”。';
-    $('preview-dialog').showModal();
+    const element = $('preview-image'), previewDialog = $('preview-dialog');
+    const cached = originalEntry(photo);
+    element.src = cached?.url || photo.previewUrl || photo.url;
+    element.alt = photo.name || '照片预览';
+    previewDialog.querySelector('p').textContent = canDeliver() ? '可长按保存图片' : '照片预览，下载请返回页面点“下载照片”。';
+    previewDialog.showModal();
+    const key = originalKey(photo), index = batch?.photos.findIndex(item => item.id === photo.id) ?? 0;
+    // Original images are requested only after a preview or download action.
+    loadOriginal(photo, Math.max(0, index)).then(entry => {
+      if (previewDialog.open && batch?.photos.some(item => originalKey(item) === key)) element.src = entry.url;
+    }).catch(() => {});
   }
   function renderPhotos() {
     grid.replaceChildren(); grid.setAttribute('aria-busy', 'false');
@@ -121,7 +157,7 @@
     batch.photos.forEach((photo, index) => {
       const tile = document.createElement('figure'); tile.className = 'photo-tile';
       const button = document.createElement('button'); button.type = 'button'; button.setAttribute('aria-label', '查看第 ' + (index + 1) + ' 张照片');
-      const image = document.createElement('img'); image.src = photo.url; image.alt = photo.name || ('照片 ' + (index + 1)); image.decoding = 'async';
+      const image = document.createElement('img'); image.src = photo.previewUrl || photo.url; image.alt = photo.name || ('照片 ' + (index + 1)); image.decoding = 'async';
       button.append(image); button.addEventListener('click', () => preview(photo));
       const number = document.createElement('span'); number.className = 'photo-number'; number.textContent = String(index + 1).padStart(2, '0') + ((photo.name || '').startsWith('AI示例') ? ' · AI示意' : '');
       tile.append(button, number); grid.append(tile);
@@ -133,7 +169,8 @@
     if (changed) revokeFiles();
     batch = valid; expired = false; loadError = false;
     if (batch?.status !== 'reserved') saveArmed = false;
-    renderPhotos(); updateButtons();
+    if (changed || !batch || !grid.children.length) renderPhotos();
+    updateButtons();
     return changed;
   }
   function applyBootstrap(value) {
@@ -149,34 +186,20 @@
     const key = photoKey();
     if (files.length === 3 && filesKey === key) return Promise.resolve(true);
     if (prefetchPromise && filesKey === key) return prefetchPromise;
-    revokeFiles(); filesKey = key;
+    filesKey = key;
     const generation = loadGeneration, photos = [...batch.photos];
-    const controller = new AbortController(); photoController = controller;
-    const timer = setTimeout(() => controller.abort(), 24000);
     const task = (async () => {
       try {
-        const prepared = await Promise.all(photos.map(async (photo, index) => {
-          const response = await fetch(photo.url, {credentials: 'same-origin', signal: controller.signal, cache: 'no-store'});
-          if (!response.ok) throw new Error('照片暂未准备好。');
-          const type = (response.headers.get('Content-Type') || '').split(';')[0].trim();
-          const ext = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp'}[type];
-          if (!ext) throw new Error('图片格式暂不支持整组保存。');
-          const blob = await response.blob();
-          if (!blob.size || blob.size > 12 * 1024 * 1024) throw new Error('图片较大，可以长按保存。');
-          return new File([blob], '爱多格-' + (index + 1) + '.' + ext, {type});
-        }));
+        const prepared = await Promise.all(photos.map((photo, index) => loadOriginal(photo, index)));
         if (generation !== loadGeneration || key !== photoKey()) return false;
         if (expiredNow()) { expireView(); return false; }
-        files = prepared; objectUrls = prepared.map(file => URL.createObjectURL(file));
+        files = prepared.map(entry => entry.file); objectUrls = prepared.map(entry => entry.url);
         return true;
       } catch {
-        // Preview files can become unavailable after another visitor claims them.
-        // Preparing a download will obtain a valid locked snapshot before delivery.
         if (generation === loadGeneration && key === photoKey()) { files = []; objectUrls = []; }
         return false;
       } finally {
-        clearTimeout(timer);
-        if (generation === loadGeneration) { prefetchPromise = null; photoController = null; updateButtons(); }
+        if (generation === loadGeneration) { prefetchPromise = null; updateButtons(); }
       }
     })();
     prefetchPromise = task; return task;
@@ -217,7 +240,7 @@
     try {
       const response = await api('/batch/cancel', {batchId: id});
       pendingCancel = null;
-      if (batch?.id === id) { applyBootstrap(response); prefetchPhotos(); }
+      if (batch?.id === id) applyBootstrap(response);
       tell('已取消，可以重新下载这组照片。');
     } catch (error) {
       if ([404, 409, 410].includes(error.status)) {
@@ -226,16 +249,40 @@
       } else tell('已取消，取消记录待同步。请连接网络后重试。', 'error');
     } finally { cancelling = false; updateButtons(); }
   }
-  function manualPanel() {
+  function manualPanel(prepareOriginals = true) {
     if (!canDeliver()) { expireView(); return; }
-    const panel = $('save-dialog-photos'); panel.replaceChildren();
-    batch.photos.forEach((photo, index) => {
-      const item = document.createElement('div');
-      const image = document.createElement('img'); image.src = photo.url; image.alt = photo.name || ('照片 ' + (index + 1));
-      const link = document.createElement('a'); link.className = 'download-one'; link.href = objectUrls[index] || photo.url; link.download = files[index]?.name || photo.name || ('爱多格-' + (index + 1) + '.jpg'); link.textContent = '下载第 ' + (index + 1) + ' 张';
-      item.append(image, link); panel.append(item);
+    const panel = $('save-dialog-photos'), key = photoKey(), photos = [...batch.photos];
+    const rows = [];
+    panel.replaceChildren();
+    photos.forEach((photo, index) => {
+      const item = document.createElement('div'), cached = originalEntry(photo);
+      const image = document.createElement('img'); image.src = cached?.url || photo.previewUrl || photo.url; image.alt = photo.name || ('照片 ' + (index + 1));
+      const link = document.createElement('a'); link.className = 'download-one';
+      link.textContent = cached?.url || !prepareOriginals ? '下载第 ' + (index + 1) + ' 张' : '准备第 ' + (index + 1) + ' 张…';
+      link.download = cached?.file?.name || photo.name || ('爱多格-' + (index + 1) + '.jpg');
+      if (cached?.url || !prepareOriginals) link.href = cached?.url || photo.url;
+      else link.setAttribute('aria-disabled', 'true');
+      link.addEventListener('click', event => { if (!link.hasAttribute('href')) event.preventDefault(); });
+      item.append(image, link); panel.append(item); rows.push({photo, image, link, index});
     });
+    const description = dialog.querySelector('.dialog-description');
+    $('manual-confirm').disabled = prepareOriginals && files.length !== 3;
+    const finish = ready => {
+      if (!dialog.open || key !== photoKey()) return;
+      $('manual-confirm').disabled = false;
+      rows.forEach(({photo, image, link, index}) => {
+        const cached = originalEntry(photo);
+        if (cached?.url) image.src = cached.url;
+        link.href = cached?.url || photo.url;
+        link.download = cached?.file?.name || photo.name || ('爱多格-' + (index + 1) + '.jpg');
+        link.textContent = '下载第 ' + (index + 1) + ' 张'; link.removeAttribute('aria-disabled');
+      });
+      description.textContent = ready ? '长按照片，选择“保存图片”。也可以点下方的逐张下载。' : '原图准备较慢，可以点下方的逐张下载重试。';
+    };
+    description.textContent = prepareOriginals && files.length !== 3 ? '正在准备原图，请稍候…' : '长按照片，选择“保存图片”。也可以点下方的逐张下载。';
     if (!dialog.open) dialog.showModal();
+    if (prepareOriginals) prefetchPhotos().then(finish);
+    else finish(false);
   }
   function startSystemShare() {
     if (!canDeliver() || !canShare() || sharing) return;
@@ -265,8 +312,8 @@
         if (photoKey() !== before) tell('原来的照片已被领取，已更新为新的 3 张。');
       }
       if (!canDeliver()) { expireView(); return; }
-      if (navigator.share && navigator.canShare) await prefetchPhotos();
-      else prefetchPhotos();
+      let originalsReady = null;
+      if (navigator.share && navigator.canShare) originalsReady = await prefetchPhotos();
       if (!canDeliver()) { expireView(); return; }
       if (canShare()) {
         if (navigator.userActivation?.isActive === true) {
@@ -274,7 +321,7 @@
         } else {
           saveArmed = true; tell('照片已准备好，再点一次保存。');
         }
-      } else manualPanel();
+      } else manualPanel(originalsReady !== false);
     } catch (error) {
       if ([404, 409, 410].includes(error.status)) {
         preparing = false;
@@ -300,7 +347,6 @@
         else throw error;
       }
       pendingCancel = null; applyBootstrap(response); saveArmed = false;
-      if (batch) prefetchPhotos();
     } catch (error) {
       if (!silent || !message.textContent) tell(error.name === 'AbortError' ? '连接超时，请重试。' : error.message, 'error');
       if (!batch && !pendingReceipt) loadError = true;

@@ -168,6 +168,24 @@ class PhotoServerIntegration(unittest.TestCase):
         self.assertEqual(len(response.data['batch']['photos']), 3)
         return response.data['batch']
 
+    def assert_jpeg_decodes(self, payload):
+        self.assertTrue(payload.startswith(b'\xff\xd8\xff'))
+        self.assertTrue(payload.endswith(b'\xff\xd9'))
+        decoder = Path('/usr/bin/sips')
+        if not decoder.is_file():
+            self.skipTest('Native JPEG decode verification requires macOS sips')
+        source = self.home / ('preview-' + secrets.token_hex(4) + '.jpg')
+        decoded = source.with_suffix('.png')
+        source.write_bytes(payload)
+        result = subprocess.run([str(decoder), '-s', 'format', 'png', str(source), '--out', str(decoded)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        self.assertEqual(result.returncode, 0, 'Native decoder could not decode JPEG preview')
+        raw = decoded.read_bytes()
+        self.assertTrue(raw.startswith(b'\x89PNG\r\n\x1a\n'))
+        width, height = struct.unpack('!II', raw[16:24])
+        self.assertGreater(min(width, height), 0)
+        self.assertLessEqual(max(width, height), 480)
+
     def restart_server(self):
         self.stop_server()
         self.process = subprocess.Popen([sys.executable, str(PROJECT / 'server.py')], cwd=PROJECT,
@@ -194,6 +212,74 @@ class PhotoServerIntegration(unittest.TestCase):
             response = self.admin.request('GET', '/api/admin/image/' + item['id'])
             self.assertEqual(response.status, 200)
             self.assertEqual(response.body, originals[item['id']])
+
+    def test_jpeg_previews_decode_for_admin_and_guest_without_changing_originals(self):
+        originals = dict(self.upload(3))
+        guest = self.client()
+        selected = self.bootstrap(guest)['batch']
+        admin_photos = {p['id']: p for p in self.dashboard()['photos']}
+        for item in selected['photos']:
+            pid = item['id']
+            self.assertEqual(item['previewUrl'], item['url'] + '?variant=preview')
+            admin_item = admin_photos[pid]
+            self.assertEqual(admin_item['previewUrl'], admin_item['url'] + '?variant=preview')
+            admin_preview = self.admin.request('GET', admin_item['previewUrl'].removeprefix(BASE))
+            guest_preview = guest.request('GET', item['previewUrl'].removeprefix(BASE))
+            self.assertEqual(admin_preview.status, 200)
+            self.assertEqual(guest_preview.status, 200)
+            self.assertEqual(dict(admin_preview.headers)['Content-Type'], 'image/jpeg')
+            self.assertEqual(dict(guest_preview.headers)['Content-Type'], 'image/jpeg')
+            self.assertEqual(admin_preview.body, guest_preview.body)
+            self.assert_jpeg_decodes(guest_preview.body)
+            for actor, url in [(guest, item['url']), (self.admin, admin_item['url'])]:
+                original = actor.request('GET', url.removeprefix(BASE))
+                self.assertEqual(original.status, 200)
+                self.assertEqual(dict(original.headers)['Content-Type'], 'image/png')
+                self.assertEqual(original.body, originals[pid])
+            self.assertEqual((self.data / 'images' / pid).read_bytes(), originals[pid])
+        dashboard = self.dashboard()
+        self.assertEqual(dashboard['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
+        self.assertTrue(all(p['usedAt'] is None for p in dashboard['photos']))
+
+    def test_preview_variants_obey_the_same_guest_and_admin_permissions(self):
+        self.upload(6)
+        owner, stranger, anonymous = self.client(), self.client(), self.client()
+        selected = self.bootstrap(owner)['batch']
+        self.bootstrap(stranger)
+        pid = selected['photos'][0]['id']
+        preview = '/api/image/' + pid + '?variant=preview'
+        self.assertEqual(anonymous.request('GET', preview).status, 401)
+        self.assertEqual(anonymous.request('GET', '/api/admin/image/' + pid + '?variant=preview').status, 401)
+        self.prepare(owner, selected['id'])
+        self.assertEqual(owner.request('GET', preview).status, 200)
+        self.assertEqual(stranger.request('GET', preview).status, 404)
+        self.assertEqual(stranger.request('GET', '/api/image/' + pid).status, 404)
+        self.assertEqual(self.commit(owner, selected['id']).status, 200)
+        self.assertEqual(owner.request('GET', preview).status, 200)
+        self.assertEqual(stranger.request('GET', preview).status, 404)
+        self.assertEqual(self.admin.request('GET', '/api/admin/image/' + pid + '?variant=preview').status, 200)
+        self.assertEqual(self.dashboard()['stats']['used'], 3)
+
+    def test_missing_preview_falls_back_to_unchanged_original_without_regeneration(self):
+        originals = dict(self.upload(3))
+        guest = self.client()
+        selected = self.bootstrap(guest)['batch']
+        item = selected['photos'][0]
+        pid = item['id']
+        thumbnail = self.data / 'thumbnails' / (pid + '.jpg')
+        self.assertTrue(thumbnail.is_file())
+        thumbnail.unlink()
+        for actor, url in [(guest, item['previewUrl']),
+                           (self.admin, BASE + '/api/admin/image/' + pid + '?variant=preview')]:
+            response = actor.request('GET', url.removeprefix(BASE))
+            self.assertEqual(response.status, 200)
+            self.assertEqual(dict(response.headers)['Content-Type'], 'image/png')
+            self.assertEqual(response.body, originals[pid])
+        self.assertFalse(thumbnail.exists(), 'Preview GET must not regenerate images')
+        self.assertEqual((self.data / 'images' / pid).read_bytes(), originals[pid])
+        dashboard = self.dashboard()
+        self.assertEqual(dashboard['stats'], {'available': 3, 'reserved': 0, 'used': 0, 'all': 3})
+        self.assertTrue(all(p['usedAt'] is None for p in dashboard['photos']))
 
     def test_preview_and_repeated_bootstrap_do_not_mark_used(self):
         self.upload(6)

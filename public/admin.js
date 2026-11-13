@@ -46,7 +46,7 @@
   function setStats(stats) { ['all', 'available', 'reserved', 'used'].forEach(key => { $('stat-' + key).textContent = String(stats?.[key] ?? 0); }); }
   function renderPhoto(photo) {
     const card = document.createElement('article'); card.className = 'admin-photo-card';
-    const image = document.createElement('img'); image.src = photo.url; image.alt = photo.name || '门店照片'; image.loading = 'lazy'; image.decoding = 'async';
+    const image = document.createElement('img'); image.src = photo.previewUrl || photo.url; image.alt = photo.name || '照片'; image.loading = 'lazy'; image.decoding = 'async';
     const body = document.createElement('div'); body.className = 'photo-card-body';
     const title = textElement('p', photo.name || '未命名照片', 'photo-card-title'); title.title = photo.name || '';
     const meta = document.createElement('div'); meta.className = 'photo-card-meta';
